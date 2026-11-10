@@ -187,6 +187,29 @@ pub enum FinishReason {
     Other(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalReason {
+    #[default]
+    Complete,
+    MaxTurns,
+    MaxTokens,
+    Interrupted,
+    Error,
+}
+
+impl TerminalReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TerminalReason::Complete => "completed",
+            TerminalReason::MaxTurns => "max_turns",
+            TerminalReason::MaxTokens => "max_tokens",
+            TerminalReason::Interrupted => "interrupted",
+            TerminalReason::Error => "error",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     Delta(String),
@@ -250,6 +273,8 @@ pub enum Event {
         turn: u32,
         prompt_tokens: u32,
         completion_tokens: u32,
+        #[serde(default)]
+        terminal_reason: TerminalReason,
     },
     Compacted {
         removed: usize,
@@ -266,4 +291,22 @@ pub enum Event {
     Error {
         message: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TerminalReason;
+
+    #[test]
+    fn terminal_reason_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&TerminalReason::MaxTurns).expect("serialize"),
+            "\"max_turns\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TerminalReason::Complete).expect("serialize"),
+            "\"complete\""
+        );
+        assert_eq!(TerminalReason::default(), TerminalReason::Complete);
+    }
 }

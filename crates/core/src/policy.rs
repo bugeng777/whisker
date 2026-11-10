@@ -230,6 +230,81 @@ mod tests {
         }
     }
 
+    struct FakeRead;
+
+    #[async_trait]
+    impl Tool for FakeRead {
+        fn name(&self) -> &str {
+            "read"
+        }
+
+        fn description(&self) -> &str {
+            ""
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+
+        fn is_read_only(&self, _args: &serde_json::Value) -> bool {
+            true
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: ToolCtx,
+            _progress: ProgressSink,
+        ) -> anyhow::Result<ToolOutput> {
+            unreachable!()
+        }
+    }
+
+    struct FakeWrite;
+
+    #[async_trait]
+    impl Tool for FakeWrite {
+        fn name(&self) -> &str {
+            "write"
+        }
+
+        fn description(&self) -> &str {
+            ""
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: ToolCtx,
+            _progress: ProgressSink,
+        ) -> anyhow::Result<ToolOutput> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn plan_mode_allows_inspection_and_denies_edits() {
+        let args = serde_json::json!({"path": "notes.txt"});
+        let plan = Policy::new(Mode::Plan, &[], &[]);
+        assert_eq!(plan.decide(&FakeRead, &args), Decision::Allow);
+        match plan.decide(&FakeWrite, &args) {
+            Decision::Deny(reason) => assert!(reason.contains("read-only")),
+            other => panic!("expected deny, got {other:?}"),
+        }
+
+        let denied = Policy::new(Mode::Plan, &[], &["read".to_string()]);
+        assert!(matches!(denied.decide(&FakeRead, &args), Decision::Deny(_)));
+
+        let normal = Policy::new(Mode::Normal, &[], &[]);
+        assert_eq!(normal.decide(&FakeWrite, &args), Decision::Ask);
+        let auto = Policy::new(Mode::AutoAccept, &[], &[]);
+        assert_eq!(auto.decide(&FakeWrite, &args), Decision::Allow);
+    }
+
     #[test]
     fn open_app_rule_uses_app_name() {
         let args = serde_json::json!({

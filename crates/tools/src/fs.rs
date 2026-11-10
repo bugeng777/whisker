@@ -604,10 +604,11 @@ impl Tool for GrepTool {
                 continue;
             }
             let path = entry.path();
-            if path == root {
-                continue;
-            }
-            let relative = path.strip_prefix(&root).unwrap_or(path);
+            let relative = if path == root {
+                path.strip_prefix(&ctx.cwd).unwrap_or(path)
+            } else {
+                path.strip_prefix(&root).unwrap_or(path)
+            };
             if let Some(filter) = &glob_filter {
                 if !filter.is_match(relative) && !filter.is_match(path) {
                     continue;
@@ -651,5 +652,67 @@ impl Tool for GrepTool {
             output.push_str(&format!("\n[Truncated at {limit} matches.]"));
         }
         Ok(ToolOutput::ok(output))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_core::{ApprovalDecision, ApprovalRequest, CancelHandle, Interactor};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    struct DenyInteractor;
+
+    #[async_trait]
+    impl Interactor for DenyInteractor {
+        async fn approve(&self, _request: ApprovalRequest) -> ApprovalDecision {
+            ApprovalDecision::Deny("test".to_string())
+        }
+
+        async fn ask(&self, _question: String, _options: Vec<String>) -> Option<String> {
+            None
+        }
+    }
+
+    fn test_ctx(cwd: PathBuf) -> ToolCtx {
+        ToolCtx {
+            cwd,
+            read_ledger: Arc::new(Mutex::new(HashMap::new())),
+            cancel: CancelHandle::new().token(),
+            spill_dir: std::env::temp_dir(),
+            interactor: Arc::new(DenyInteractor),
+        }
+    }
+
+    #[tokio::test]
+    async fn grep_searches_explicit_files_and_directories() {
+        let root = std::env::temp_dir().join(format!("whisker-grep-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("temp dir");
+        fs::write(root.join("sample.txt"), "hello world\nneedle here\n").expect("sample");
+
+        let tool = GrepTool;
+        let file_output = tool
+            .execute(
+                json!({"pattern": "needle", "path": "sample.txt"}),
+                test_ctx(root.clone()),
+                ProgressSink::default(),
+            )
+            .await
+            .expect("grep file");
+        assert_eq!(file_output.content, "sample.txt:2:needle here");
+
+        let dir_output = tool
+            .execute(
+                json!({"pattern": "hello", "path": "."}),
+                test_ctx(root.clone()),
+                ProgressSink::default(),
+            )
+            .await
+            .expect("grep dir");
+        assert!(dir_output.content.contains("sample.txt:1:hello world"));
+
+        fs::remove_dir_all(&root).ok();
     }
 }

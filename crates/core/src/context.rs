@@ -2,7 +2,20 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-pub const REMINDER_MIN_TOOL_CALLS: u32 = 5;
+#[derive(Debug, Clone, Copy)]
+pub struct ReminderPolicy {
+    pub todo_after_turns: u32,
+    pub todo_interval_turns: u32,
+}
+
+impl Default for ReminderPolicy {
+    fn default() -> Self {
+        Self {
+            todo_after_turns: 10,
+            todo_interval_turns: 10,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -79,8 +92,12 @@ pub struct TurnContext {
     pub mode: Mode,
     pub todos: Vec<TodoItem>,
     pub edits_since_verify: u32,
-    pub tool_calls_since_todo_update: u32,
-    pub tools_since_user: u32,
+    #[serde(default)]
+    pub turns_since_todo_write: u32,
+    #[serde(default)]
+    pub turns_since_todo_reminder: u32,
+    #[serde(default)]
+    pub todo_reminders_sent: u32,
     #[serde(default)]
     pub reminders_sent: HashSet<String>,
 }
@@ -91,8 +108,9 @@ impl Default for TurnContext {
             mode: Mode::Normal,
             todos: Vec::new(),
             edits_since_verify: 0,
-            tool_calls_since_todo_update: 0,
-            tools_since_user: 0,
+            turns_since_todo_write: 0,
+            turns_since_todo_reminder: 0,
+            todo_reminders_sent: 0,
             reminders_sent: HashSet::new(),
         }
     }
@@ -100,13 +118,12 @@ impl Default for TurnContext {
 
 impl TurnContext {
     pub fn begin_turn(&mut self) {
-        self.tools_since_user = 0;
         self.reminders_sent.clear();
     }
 
-    pub fn on_tool_call(&mut self) {
-        self.tools_since_user += 1;
-        self.tool_calls_since_todo_update += 1;
+    pub fn on_assistant_turn(&mut self) {
+        self.turns_since_todo_write = self.turns_since_todo_write.saturating_add(1);
+        self.turns_since_todo_reminder = self.turns_since_todo_reminder.saturating_add(1);
     }
 
     pub fn on_tool_result(&mut self, tool: &str, is_error: bool, command: Option<&str>) {
@@ -126,8 +143,9 @@ impl TurnContext {
 
     pub fn on_todo_update(&mut self, todos: Vec<TodoItem>) {
         self.todos = todos;
-        self.tool_calls_since_todo_update = 0;
-        self.reminders_sent.remove("todo_create");
+        self.turns_since_todo_write = 0;
+        self.turns_since_todo_reminder = 0;
+        self.todo_reminders_sent = 0;
         self.reminders_sent.remove("todo_single");
     }
 
@@ -138,17 +156,27 @@ impl TurnContext {
             .count()
     }
 
-    pub fn due_reminders(&mut self) -> Vec<(String, String)> {
+    pub fn due_reminders(
+        &mut self,
+        todo_tool_available: bool,
+        policy: ReminderPolicy,
+    ) -> Vec<(String, String)> {
         let mut out = Vec::new();
 
-        if self.todos.is_empty()
-            && self.tools_since_user >= REMINDER_MIN_TOOL_CALLS
-            && self.reminders_sent.insert("todo_create".to_string())
+        let after = policy.todo_after_turns.max(1);
+        let interval = policy.todo_interval_turns.max(1);
+        if todo_tool_available
+            && self.turns_since_todo_write >= after
+            && (self.todo_reminders_sent == 0 || self.turns_since_todo_reminder >= interval)
         {
-            out.push((
-                "todo_create".to_string(),
-                "This looks like a multi-step task and no todo list exists yet. Use the todo_write tool to plan the work and keep exactly one item in_progress while you execute.".to_string(),
-            ));
+            self.turns_since_todo_reminder = 0;
+            self.todo_reminders_sent = self.todo_reminders_sent.saturating_add(1);
+            let text = if self.todos.is_empty() {
+                "The todo tool has not been used yet for this task. Use the todo_write tool to plan the work and keep exactly one item in_progress while you execute."
+            } else {
+                "The todo list has not been updated recently. Use the todo_write tool to update statuses and keep exactly one item in_progress."
+            };
+            out.push(("todo_reminder".to_string(), text.to_string()));
         }
 
         if !self.todos.is_empty()
@@ -207,4 +235,94 @@ pub fn is_verification_command(command: &str) -> bool {
         "eslint",
     ];
     MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn one_in_progress() -> Vec<TodoItem> {
+        vec![TodoItem {
+            id: "1".to_string(),
+            content: "work".to_string(),
+            status: TodoStatus::InProgress,
+        }]
+    }
+
+    fn todo_reminders(due: &[(String, String)]) -> usize {
+        due.iter()
+            .filter(|(kind, _)| kind == "todo_reminder")
+            .count()
+    }
+
+    #[test]
+    fn todo_reminder_waits_for_ten_agentic_turns() {
+        let mut ctx = TurnContext::default();
+        ctx.on_todo_update(one_in_progress());
+        let policy = ReminderPolicy::default();
+
+        for _ in 0..9 {
+            ctx.on_assistant_turn();
+            assert_eq!(todo_reminders(&ctx.due_reminders(true, policy)), 0);
+        }
+        ctx.on_assistant_turn();
+        let due = ctx.due_reminders(true, policy);
+        assert_eq!(todo_reminders(&due), 1);
+        assert!(due[0].1.contains("not been updated"));
+
+        for _ in 0..9 {
+            ctx.on_assistant_turn();
+            assert_eq!(todo_reminders(&ctx.due_reminders(true, policy)), 0);
+        }
+        ctx.on_assistant_turn();
+        assert_eq!(todo_reminders(&ctx.due_reminders(true, policy)), 1);
+    }
+
+    #[test]
+    fn todo_reminder_requires_the_todo_tool() {
+        let mut ctx = TurnContext::default();
+        let policy = ReminderPolicy::default();
+        for _ in 0..10 {
+            ctx.on_assistant_turn();
+        }
+        assert_eq!(todo_reminders(&ctx.due_reminders(false, policy)), 0);
+        let due = ctx.due_reminders(true, policy);
+        assert_eq!(todo_reminders(&due), 1);
+        assert!(due[0].1.contains("has not been used yet"));
+    }
+
+    #[test]
+    fn todo_write_resets_reminder_counters() {
+        let mut ctx = TurnContext::default();
+        let policy = ReminderPolicy::default();
+        for _ in 0..10 {
+            ctx.on_assistant_turn();
+        }
+        ctx.on_todo_update(one_in_progress());
+        for _ in 0..9 {
+            ctx.on_assistant_turn();
+            assert_eq!(todo_reminders(&ctx.due_reminders(true, policy)), 0);
+        }
+        ctx.on_assistant_turn();
+        assert_eq!(todo_reminders(&ctx.due_reminders(true, policy)), 1);
+    }
+
+    #[test]
+    fn todo_reminder_thresholds_are_configurable() {
+        let mut ctx = TurnContext::default();
+        let policy = ReminderPolicy {
+            todo_after_turns: 2,
+            todo_interval_turns: 3,
+        };
+        ctx.on_assistant_turn();
+        assert_eq!(todo_reminders(&ctx.due_reminders(true, policy)), 0);
+        ctx.on_assistant_turn();
+        assert_eq!(todo_reminders(&ctx.due_reminders(true, policy)), 1);
+
+        ctx.on_assistant_turn();
+        ctx.on_assistant_turn();
+        assert_eq!(todo_reminders(&ctx.due_reminders(true, policy)), 0);
+        ctx.on_assistant_turn();
+        assert_eq!(todo_reminders(&ctx.due_reminders(true, policy)), 1);
+    }
 }

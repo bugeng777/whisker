@@ -1,11 +1,11 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agent_core::{
     ApprovalDecision, ApprovalRequest, CancelHandle, Event, GenerationSettings, ModelSettings,
-    ModelSettingsStore, TodoItem, TodoStatus,
+    ModelSettingsStore, TerminalReason, TodoItem, TodoStatus,
 };
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -38,6 +38,47 @@ const SETTINGS_TABS: &[&str] = &["Settings", "Status", "Usage"];
 const DEEPSEEK_EFFORTS: &[&str] = &["low", "high", "max"];
 const MAX_TOKEN_PRESETS: &[Option<u32>] =
     &[None, Some(8_192), Some(32_768), Some(65_536), Some(131_072)];
+
+const TIPS: &[&str] = &[
+    "/model configures thinking, effort, and context per model.",
+    "shift+tab cycles normal, plan, and auto modes.",
+    "esc interrupts the current turn.",
+    "read-before-edit is enforced by the harness.",
+    "tool output over 32K chars spills to disk.",
+    "use /compact to summarize long history.",
+    "MCP sidecars add tools without changing the core.",
+    "todo reminders fire after 10 turns without a todo update.",
+];
+
+fn thinking_word(elapsed: Duration) -> &'static str {
+    let ms = elapsed.as_millis();
+    if ms >= 45_000 {
+        "deep in thought"
+    } else if ms >= 30_000 {
+        "thinking some more"
+    } else if ms >= 20_000 {
+        "thinking more"
+    } else if ms >= 10_000 {
+        "still thinking"
+    } else {
+        "thinking"
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    let ms = duration.as_millis();
+    if ms < 10_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else if ms < 60_000 {
+        format!("{}s", ms / 1000)
+    } else {
+        format!("{}m {}s", ms / 60_000, (ms % 60_000) / 1000)
+    }
+}
+
+fn thought_seconds(duration: Duration) -> u64 {
+    ((duration.as_millis() as f64 / 1000.0).round() as u64).max(1)
+}
 const TEMPERATURE_PRESETS: &[f32] = &[0.0, 0.2, 0.5, 1.0, 1.5, 2.0];
 const CONTEXT_PRESETS: &[usize] = &[128_000, 256_000, 524_288, 1_048_576];
 
@@ -193,6 +234,12 @@ struct TuiState {
     input: String,
     ask_input: String,
     busy: bool,
+    busy_since: Option<Instant>,
+    last_stream_at: Option<Instant>,
+    thinking_since: Option<Instant>,
+    thought_for: Option<(Duration, Instant)>,
+    active_tools: HashMap<String, Instant>,
+    tool_done: Option<(Duration, Instant)>,
     spinner: usize,
     spinner_verb: String,
     mode: String,
@@ -222,6 +269,8 @@ struct TuiState {
     toast: Option<(String, Instant)>,
     settings: Option<SettingsPage>,
     show_tips: bool,
+    tip_index: usize,
+    tips_shown: u32,
     reduce_motion: bool,
     turns: u32,
 }
@@ -233,6 +282,12 @@ impl TuiState {
             input: String::new(),
             ask_input: String::new(),
             busy: false,
+            busy_since: None,
+            last_stream_at: None,
+            thinking_since: None,
+            thought_for: None,
+            active_tools: HashMap::new(),
+            tool_done: None,
             spinner: 0,
             spinner_verb: brand::random_verb().to_string(),
             mode,
@@ -262,6 +317,8 @@ impl TuiState {
             toast: None,
             settings: None,
             show_tips: true,
+            tip_index: 0,
+            tips_shown: 0,
             reduce_motion: false,
             turns: 0,
         };
@@ -300,6 +357,87 @@ impl TuiState {
         } else {
             truncate(&one_line, max_chars)
         }
+    }
+
+    fn begin_busy(&mut self) {
+        let now = Instant::now();
+        self.busy = true;
+        self.busy_since = Some(now);
+        self.last_stream_at = Some(now);
+        self.thinking_since = None;
+        self.thought_for = None;
+        self.active_tools.clear();
+        self.tool_done = None;
+        self.spinner_verb = brand::random_verb().to_string();
+        self.spinner = 0;
+        if self.tips_shown > 0 {
+            self.tip_index = (self.tip_index + 1) % TIPS.len();
+        }
+        self.tips_shown = self.tips_shown.saturating_add(1);
+    }
+
+    fn end_thinking(&mut self) {
+        let now = Instant::now();
+        if let Some(start) = self.thinking_since.take() {
+            let duration = now.saturating_duration_since(start);
+            self.thought_for = Some((duration, now + Duration::from_secs(2)));
+        }
+    }
+
+    fn busy_status(&self, now: Instant) -> (String, Color) {
+        if let Some(start) = self.thinking_since {
+            let elapsed = now.saturating_duration_since(start);
+            return (
+                format!(
+                    "{} {} · {}s",
+                    thinking_word(elapsed),
+                    brand::dots(self.spinner).trim_end(),
+                    elapsed.as_secs()
+                ),
+                ACCENT,
+            );
+        }
+        if let Some(start) = self.active_tools.values().min().copied() {
+            let elapsed = now.saturating_duration_since(start);
+            return (
+                format!("running tool for {}", format_duration(elapsed)),
+                ACCENT,
+            );
+        }
+        if let Some((duration, until)) = self.tool_done {
+            if now < until {
+                return (
+                    format!("ran tool for {}", format_duration(duration)),
+                    ACCENT,
+                );
+            }
+        }
+        if let Some((duration, until)) = self.thought_for {
+            if now < until {
+                return (format!("thought for {}s", thought_seconds(duration)), DIM);
+            }
+        }
+        let idle = now.saturating_duration_since(self.last_stream_at.unwrap_or(now));
+        let stalled = idle > Duration::from_secs(10) && self.active_tools.is_empty();
+        let elapsed = self
+            .busy_since
+            .map(|start| now.saturating_duration_since(start))
+            .unwrap_or_default();
+        let verb = self.activity_word(32);
+        let dots = brand::dots(self.spinner).trim_end();
+        let text = if elapsed.as_secs() >= 1 {
+            format!("{verb} {dots} · {}s", elapsed.as_secs())
+        } else {
+            format!("{verb} {dots}")
+        };
+        let color = if stalled {
+            YELLOW
+        } else if self.scanning {
+            PLAN
+        } else {
+            ACCENT
+        };
+        (text, color)
     }
 
     fn push(&mut self, text: &str, style: Style) {
@@ -1372,11 +1510,9 @@ fn submit(
         return;
     }
     if cmd_tx.send(Command::UserInput(text)).is_ok() {
-        state.busy = true;
-        state.spinner_verb = brand::random_verb().to_string();
+        state.begin_busy();
         state.turn_text = false;
         state.scanning = false;
-        state.spinner = 0;
         state.follow = true;
     }
 }
@@ -1542,6 +1678,9 @@ fn handle_event(state: &mut TuiState, event: Event) {
             state.push_line("", Style::default());
         }
         Event::AssistantDelta { text } => {
+            state.end_thinking();
+            state.last_stream_at = Some(Instant::now());
+            state.tool_done = None;
             state.turn_text = true;
             if !state.answer_open {
                 state.answer_open = true;
@@ -1550,8 +1689,21 @@ fn handle_event(state: &mut TuiState, event: Event) {
             }
             state.push(&text, Style::default());
         }
-        Event::AssistantReasoning { .. } => {}
-        Event::ToolStart { name, args, .. } => {
+        Event::AssistantReasoning { .. } => {
+            let now = Instant::now();
+            if state.thinking_since.is_none() {
+                state.thinking_since = Some(now);
+            }
+            state.thought_for = None;
+            state.tool_done = None;
+            state.last_stream_at = Some(now);
+        }
+        Event::ToolStart { id, name, args } => {
+            let now = Instant::now();
+            state.end_thinking();
+            state.active_tools.insert(id, now);
+            state.last_stream_at = Some(now);
+            state.tool_done = None;
             state.scanning = matches!(name.as_str(), "read" | "grep" | "glob" | "lsp" | "skill");
             state.ensure_blank_line();
             state.push_line(
@@ -1565,8 +1717,19 @@ fn handle_event(state: &mut TuiState, event: Event) {
             }
         }
         Event::ToolResult {
-            content, is_error, ..
+            id,
+            content,
+            is_error,
+            ..
         } => {
+            let now = Instant::now();
+            if let Some(start) = state.active_tools.remove(&id) {
+                let duration = now.saturating_duration_since(start);
+                if duration >= Duration::from_secs(2) {
+                    state.tool_done = Some((duration, now + Duration::from_secs(2)));
+                }
+            }
+            state.last_stream_at = Some(now);
             state.answer_open = false;
             let style = if is_error {
                 Style::default().fg(RED)
@@ -1577,7 +1740,9 @@ fn handle_event(state: &mut TuiState, event: Event) {
                 state.push_line(&format!("  └ {}", truncate(line, 160)), style);
             }
         }
-        Event::ToolDenied { reason, .. } => {
+        Event::ToolDenied { id, reason, .. } => {
+            state.active_tools.remove(&id);
+            state.last_stream_at = Some(Instant::now());
             state.ensure_line_start();
             state.push_line(&format!("  └ denied: {reason}"), Style::default().fg(RED));
         }
@@ -1599,14 +1764,27 @@ fn handle_event(state: &mut TuiState, event: Event) {
         Event::TurnFinished {
             prompt_tokens,
             completion_tokens,
+            terminal_reason,
             ..
         } => {
             state.busy = false;
+            state.busy_since = None;
+            state.last_stream_at = None;
+            state.thinking_since = None;
+            state.thought_for = None;
+            state.active_tools.clear();
+            state.tool_done = None;
             state.scanning = false;
             state.answer_open = false;
             state.success_until = Instant::now() + Duration::from_secs(2);
             state.total_in = state.total_in.saturating_add(prompt_tokens);
             state.total_out = state.total_out.saturating_add(completion_tokens);
+            if terminal_reason != TerminalReason::Complete {
+                state.toast = Some((
+                    format!("terminal · {}", terminal_reason.as_str()),
+                    Instant::now() + Duration::from_secs(3),
+                ));
+            }
             if state.mode == "plan" && state.turn_text {
                 state.picker = None;
                 state.plan_pending = true;
@@ -1642,6 +1820,10 @@ fn handle_event(state: &mut TuiState, event: Event) {
         }
         Event::TurnStarted { .. } => {
             state.turns = state.turns.saturating_add(1);
+            state.busy = true;
+            state.last_stream_at = Some(Instant::now());
+            state.thinking_since = None;
+            state.thought_for = None;
             if state
                 .todos
                 .iter()
@@ -1650,7 +1832,11 @@ fn handle_event(state: &mut TuiState, event: Event) {
                 state.spinner_verb = brand::random_verb().to_string();
             }
         }
-        Event::SessionStarted { .. } | Event::AssistantMessage { .. } => {}
+        Event::AssistantMessage { .. } => {
+            state.end_thinking();
+            state.last_stream_at = Some(Instant::now());
+        }
+        Event::SessionStarted { .. } => {}
     }
 }
 
@@ -2239,24 +2425,20 @@ fn render_welcome(frame: &mut Frame, area: Rect, state: &TuiState, model: &str) 
         "auto" => ACCENT,
         _ => OK,
     };
-    let status = if state.busy {
-        format!(
-            "{} {}",
-            state.activity_word(32),
-            brand::dots(state.spinner).trim_end()
-        )
+    let (status, status_color) = if state.busy {
+        state.busy_status(Instant::now())
     } else {
-        match pose {
+        let text = match pose {
             Pose::Scanning => "scanning".to_string(),
             Pose::Success => "purring".to_string(),
             _ => "ready".to_string(),
-        }
-    };
-    let status_color = match pose {
-        Pose::Working => ACCENT,
-        Pose::Scanning => PLAN,
-        Pose::Success => OK,
-        Pose::Idle => DIM,
+        };
+        let color = match pose {
+            Pose::Scanning => PLAN,
+            Pose::Success => OK,
+            _ => DIM,
+        };
+        (text, color)
     };
     let lines = vec![
         Line::from(vec![
@@ -2276,7 +2458,9 @@ fn render_welcome(frame: &mut Frame, area: Rect, state: &TuiState, model: &str) 
         ]),
         Line::from(Span::styled(status, Style::default().fg(status_color))),
         if state.show_tips {
-            Line::from(Span::styled("enter send · /help for commands", dim()))
+            let width = cols[2].width.saturating_sub(5) as usize;
+            let tip = truncate(TIPS[state.tip_index % TIPS.len()], width.max(1));
+            Line::from(Span::styled(format!("Tip: {tip}"), dim()))
         } else {
             Line::from("")
         },
@@ -2701,6 +2885,182 @@ mod tests {
             .draw(|frame| render(frame, &mut state, "mock", "session"))
             .expect("draw");
         assert!(buffer_text(&terminal).contains("Running tests"));
+    }
+
+    #[test]
+    fn thinking_status_escalates_with_duration() {
+        assert_eq!(thinking_word(Duration::from_secs(5)), "thinking");
+        assert_eq!(thinking_word(Duration::from_secs(10)), "still thinking");
+        assert_eq!(thinking_word(Duration::from_secs(20)), "thinking more");
+        assert_eq!(thinking_word(Duration::from_secs(30)), "thinking some more");
+        assert_eq!(thinking_word(Duration::from_secs(45)), "deep in thought");
+    }
+
+    #[test]
+    fn busy_status_shows_thinking_and_thought_for() {
+        let now = Instant::now();
+        let mut state = TuiState::new("normal".to_string());
+        state.busy = true;
+        state.spinner_verb = "Musing".to_string();
+        state.thinking_since = now.checked_sub(Duration::from_secs(12));
+        state.last_stream_at = Some(now);
+
+        let (text, color) = state.busy_status(now);
+        assert!(text.starts_with("still thinking"));
+        assert!(text.contains("12s"));
+        assert_eq!(color, ACCENT);
+
+        state.thinking_since = None;
+        state.thought_for = Some((Duration::from_millis(4_200), now + Duration::from_secs(1)));
+        let (text, color) = state.busy_status(now);
+        assert_eq!(text, "thought for 4s");
+        assert_eq!(color, DIM);
+    }
+
+    #[test]
+    fn reasoning_events_drive_thinking_status() {
+        let mut state = TuiState::new("normal".to_string());
+        state.busy = true;
+        handle_event(
+            &mut state,
+            Event::AssistantReasoning {
+                text: "considering".to_string(),
+            },
+        );
+        assert!(state.thinking_since.is_some());
+        let (text, _) = state.busy_status(Instant::now());
+        assert!(text.starts_with("thinking"));
+
+        let before = Instant::now();
+        handle_event(
+            &mut state,
+            Event::AssistantMessage {
+                content: "ok".to_string(),
+                tool_calls: Vec::new(),
+            },
+        );
+        assert!(state.thinking_since.is_none());
+        let (_, until) = state.thought_for.expect("thought-for window");
+        assert!(until >= before + Duration::from_secs(2));
+        assert!(state
+            .busy_status(Instant::now())
+            .0
+            .starts_with("thought for"));
+    }
+
+    #[test]
+    fn busy_status_marks_stall_after_ten_idle_seconds() {
+        let now = Instant::now();
+        let mut state = TuiState::new("normal".to_string());
+        state.busy = true;
+        state.spinner_verb = "Musing".to_string();
+        state.busy_since = now.checked_sub(Duration::from_secs(12));
+        state.last_stream_at = now.checked_sub(Duration::from_secs(11));
+
+        let (text, color) = state.busy_status(now);
+        assert!(text.contains("Musing"));
+        assert!(text.contains("12s"));
+        assert_eq!(color, YELLOW);
+
+        state.last_stream_at = now.checked_sub(Duration::from_secs(5));
+        assert_eq!(state.busy_status(now).1, ACCENT);
+
+        state.last_stream_at = now.checked_sub(Duration::from_secs(11));
+        state.active_tools.insert(
+            "tool".to_string(),
+            now.checked_sub(Duration::from_secs(11)).unwrap(),
+        );
+        assert_eq!(state.busy_status(now).1, ACCENT);
+    }
+
+    #[test]
+    fn tool_status_uses_validated_text() {
+        let now = Instant::now();
+        let mut state = TuiState::new("normal".to_string());
+        state.busy = true;
+        state.active_tools.insert(
+            "tool".to_string(),
+            now.checked_sub(Duration::from_secs(3)).unwrap(),
+        );
+        assert_eq!(state.busy_status(now).0, "running tool for 3.0s");
+
+        state.active_tools.clear();
+        state.tool_done = Some((Duration::from_millis(2_500), now + Duration::from_secs(1)));
+        assert_eq!(state.busy_status(now).0, "ran tool for 2.5s");
+    }
+
+    #[test]
+    fn tips_rotate_once_per_prompt_and_wrap() {
+        let mut state = TuiState::new("normal".to_string());
+        assert_eq!(state.tip_index, 0);
+        state.begin_busy();
+        assert_eq!(state.tip_index, 0);
+        let mut seen = vec![state.tip_index];
+        for _ in 0..TIPS.len() {
+            state.begin_busy();
+            seen.push(state.tip_index);
+        }
+        assert_eq!(
+            seen,
+            (0..=TIPS.len())
+                .map(|index| index % TIPS.len())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn renders_tip_prefix_and_respects_toggle() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut state = TuiState::new("normal".to_string());
+        terminal
+            .draw(|frame| render(frame, &mut state, "mock", "session"))
+            .expect("draw");
+        assert!(buffer_text(&terminal).contains("Tip: /model"));
+
+        state.show_tips = false;
+        terminal
+            .draw(|frame| render(frame, &mut state, "mock", "session"))
+            .expect("draw");
+        assert!(!buffer_text(&terminal).contains("Tip: /model"));
+    }
+
+    #[test]
+    fn renders_thinking_and_tool_status_in_header() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut state = TuiState::new("normal".to_string());
+        state.busy = true;
+        state.spinner_verb = "Musing".to_string();
+        state.busy_since = Some(Instant::now());
+        state.last_stream_at = Some(Instant::now());
+        state.thinking_since = Instant::now().checked_sub(Duration::from_secs(12));
+
+        terminal
+            .draw(|frame| render(frame, &mut state, "mock", "session"))
+            .expect("draw");
+        let text = buffer_text(&terminal);
+        assert!(text.contains("still thinking"));
+        assert!(text.contains("12s"));
+
+        state.thinking_since = None;
+        state.tool_done = Some((
+            Duration::from_millis(2_500),
+            Instant::now() + Duration::from_secs(1),
+        ));
+        terminal
+            .draw(|frame| render(frame, &mut state, "mock", "session"))
+            .expect("draw");
+        assert!(buffer_text(&terminal).contains("ran tool for 2.5s"));
+    }
+
+    #[test]
+    fn duration_formatting_is_compact() {
+        assert_eq!(format_duration(Duration::from_millis(500)), "0.5s");
+        assert_eq!(format_duration(Duration::from_secs(12)), "12s");
+        assert_eq!(format_duration(Duration::from_secs(65)), "1m 5s");
+        assert_eq!(thought_seconds(Duration::from_millis(400)), 1);
+        assert_eq!(thought_seconds(Duration::from_millis(4_600)), 5);
     }
 
     #[test]

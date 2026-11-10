@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use agent_core::{
     Agent, ApprovalDecision, ApprovalRequest, CancelHandle, Event, GenerationSettings, Interactor,
-    Mode, TodoItem, TodoStatus,
+    Mode, TerminalReason, TodoItem, TodoStatus,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -403,6 +403,7 @@ pub async fn run_repl(
                 Event::TurnFinished {
                     prompt_tokens,
                     completion_tokens,
+                    terminal_reason,
                     ..
                 } => {
                     if waiting {
@@ -415,6 +416,12 @@ pub async fn run_repl(
                     out_line(&format!(
                         "\x1b[2m— tokens in {prompt_tokens} / out {completion_tokens}\x1b[0m"
                     ));
+                    if terminal_reason != TerminalReason::Complete {
+                        out_line(&format!(
+                            "\x1b[2mterminal: {}\x1b[0m",
+                            terminal_reason.as_str()
+                        ));
+                    }
                     if mode == "plan" && turn_text {
                         turn_text = false;
                         if prompt_plan_approval(&mut key_rx).await {

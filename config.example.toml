@@ -4,6 +4,22 @@
 profile = "deepseek"
 # Optional safety cap. Omit to wait for the model's finish signal (stop/tool-calls/max-tokens).
 # max_turns = 40
+# Subagent limits: model turns and concurrently running agents. Subagents get
+# read-only tools only, and nested subagents are refused (max depth 1).
+# subagent_max_turns = 8
+# subagent_max_concurrency = 2
+# Opt-in deferred tools: hidden tools are discovered through tool_search.
+# deferred_tools = ["read", "grep"]
+# defer_mcp_tools = true
+# Auto-compaction threshold. The default is 90% of the effective context window
+# (Claude's validated 180k/200k threshold); compact_window takes precedence as an
+# absolute token count when set.
+# compact_ratio = 0.9
+# compact_window = 900000
+# Todo reminders follow Claude's 10/10 policy in agentic turns and only fire when
+# the todo_write tool is available. Both thresholds are configurable.
+# todo_reminder_after = 10
+# todo_reminder_interval = 10
 temperature = 0.2
 # Restrict bash file writes to the workspace and temp dirs (macOS seatbelt).
 sandbox = false
@@ -49,6 +65,16 @@ deny = []
 # stdin and in WHISKER_TOOL_ARGS; WHISKER_TOOL_NAME and WHISKER_HOOK_PHASE are also set.
 # pre_tool_use = ["echo \"$WHISKER_TOOL_NAME\""]
 # post_tool_use = []
+# Stop hook: runs when a turn would finish; JSON payload on stdin. Print
+# {"decision":"block","reason":"..."} to continue the turn once.
+# stop = []
+# Lifecycle hooks are observational. They receive a JSON payload on stdin with
+# hook_event_name, session_id, transcript_path, cwd and model; compaction hooks
+# also get trigger and (post_compact) messages_removed.
+# session_start = []
+# session_end = []
+# pre_compact = []
+# post_compact = []
 
 # MCP sidecars are the extension mechanism.
 # [mcp_servers.filesystem]

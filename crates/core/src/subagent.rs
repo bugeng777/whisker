@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::LlmClient;
@@ -33,6 +33,7 @@ pub struct SubagentTool {
     pub llm: Arc<dyn LlmClient>,
     pub tools: Arc<ToolRegistry>,
     pub max_turns: u32,
+    pub slots: Semaphore,
     pub system_prompt: String,
     pub generation: GenerationSettings,
 }
@@ -76,6 +77,9 @@ impl SubagentTool {
     }
 
     async fn run_tool_call(&self, name: &str, raw_args: &str, ctx: &ToolCtx) -> String {
+        if name == "agent" {
+            return "Nested subagents are not allowed (max depth 1).".to_string();
+        }
         let args: Value = if raw_args.trim().is_empty() {
             json!({})
         } else {
@@ -185,6 +189,14 @@ impl Tool for SubagentTool {
             format!("{task}\n\nAdditional context:\n{extra}")
         };
 
+        let _permit = tokio::select! {
+            _ = ctx.cancel.cancelled() => return Ok(ToolOutput::err("Subagent cancelled.")),
+            permit = self.slots.acquire() => match permit {
+                Ok(permit) => permit,
+                Err(_) => return Ok(ToolOutput::err("Subagent unavailable.")),
+            },
+        };
+
         let mut messages = vec![
             Message::system(self.system_prompt.clone()),
             Message::user(prompt),
@@ -262,5 +274,108 @@ impl Tool for SubagentTool {
             final_text
         };
         Ok(ToolOutput::ok(report))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    struct ProbeLlm {
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl LlmClient for ProbeLlm {
+        fn model(&self) -> String {
+            "probe".to_string()
+        }
+
+        fn set_model(&self, _model: &str) -> bool {
+            false
+        }
+
+        fn context_window(&self) -> usize {
+            1_000
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: ChatRequest,
+            sink: mpsc::UnboundedSender<StreamEvent>,
+            _cancel: CancellationToken,
+        ) -> Result<Usage> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            let _ = sink.send(StreamEvent::Delta("done".to_string()));
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(Usage::default())
+        }
+    }
+
+    fn test_tool(slots: usize, delay: Duration) -> (SubagentTool, Arc<ProbeLlm>) {
+        let llm = Arc::new(ProbeLlm {
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            delay,
+        });
+        let tool = SubagentTool {
+            llm: llm.clone(),
+            tools: Arc::new(ToolRegistry::new(Vec::new())),
+            max_turns: 1,
+            slots: Semaphore::new(slots),
+            system_prompt: "test".to_string(),
+            generation: GenerationSettings::default(),
+        };
+        (tool, llm)
+    }
+
+    fn test_ctx() -> ToolCtx {
+        ToolCtx {
+            cwd: PathBuf::from("."),
+            read_ledger: Arc::new(Mutex::new(HashMap::new())),
+            cancel: CancellationToken::new(),
+            spill_dir: PathBuf::from("."),
+            interactor: Arc::new(ReadOnlyInteractor),
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrency_limit_serializes_subagents() {
+        let (tool, llm) = test_tool(1, Duration::from_millis(60));
+        let args = json!({"task": "probe"});
+        let (first, second) = tokio::join!(
+            tool.execute(args.clone(), test_ctx(), ProgressSink::default()),
+            tool.execute(args, test_ctx(), ProgressSink::default()),
+        );
+        assert!(first.expect("first").content.contains("done"));
+        assert!(second.expect("second").content.contains("done"));
+        assert_eq!(llm.max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrency_limit_allows_configured_parallelism() {
+        let (tool, llm) = test_tool(2, Duration::from_millis(60));
+        let args = json!({"task": "probe"});
+        let (first, second) = tokio::join!(
+            tool.execute(args.clone(), test_ctx(), ProgressSink::default()),
+            tool.execute(args, test_ctx(), ProgressSink::default()),
+        );
+        assert!(first.expect("first").content.contains("done"));
+        assert!(second.expect("second").content.contains("done"));
+        assert_eq!(llm.max_active.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn nested_subagents_are_refused() {
+        let (tool, _) = test_tool(1, Duration::ZERO);
+        let output = tool.run_tool_call("agent", "{}", &test_ctx()).await;
+        assert!(output.contains("max depth 1"));
     }
 }

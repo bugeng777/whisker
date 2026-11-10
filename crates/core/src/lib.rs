@@ -8,9 +8,9 @@ pub mod subagent;
 pub mod tool;
 pub mod types;
 
-pub use agent::{Agent, AgentConfig};
+pub use agent::{run_lifecycle_hooks, Agent, AgentConfig};
 pub use cancel::CancelHandle;
-pub use context::{Mode, TodoItem, TodoStatus, TurnContext};
+pub use context::{Mode, ReminderPolicy, TodoItem, TodoStatus, TurnContext};
 pub use llm::LlmClient;
 pub use policy::{ApprovalDecision, ApprovalRequest, Decision, Interactor, Policy};
 pub use session::{ConversationState, SessionStore};
@@ -18,5 +18,5 @@ pub use subagent::SubagentTool;
 pub use tool::{ProgressSink, Tool, ToolCtx, ToolOutput, ToolRegistry};
 pub use types::{
     ChatRequest, Event, GenerationSettings, Message, ModelSettings, ModelSettingsStore,
-    StreamEvent, ToolCall, ToolSpec, Usage,
+    StreamEvent, TerminalReason, ToolCall, ToolSpec, Usage,
 };

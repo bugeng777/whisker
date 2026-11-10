@@ -1,14 +1,15 @@
 mod config;
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_core::{
-    Agent, AgentConfig, ApprovalDecision, ApprovalRequest, CancelHandle, Event, GenerationSettings,
-    Interactor, LlmClient, Mode, ModelSettingsStore, Policy, SessionStore, Tool, ToolRegistry,
+    run_lifecycle_hooks, Agent, AgentConfig, ApprovalDecision, ApprovalRequest, CancelHandle,
+    Event, GenerationSettings, Interactor, LlmClient, Mode, ModelSettingsStore, Policy,
+    ReminderPolicy, SessionStore, TerminalReason, Tool, ToolRegistry,
 };
 use agent_llm::{OpenAiProvider, ReasoningPolicy};
 use agent_tools::native_tools;
@@ -224,6 +225,7 @@ async fn main() -> Result<()> {
         SessionStore::create(&session_base, &model)?
     };
     let session_id = session.state.id.clone();
+    let transcript_path = session.dir.join("events.jsonl").display().to_string();
 
     let sandbox = config.agent.sandbox.unwrap_or(false);
     let mut tools = native_tools(sandbox);
@@ -251,12 +253,31 @@ async fn main() -> Result<()> {
     tools.push(Arc::new(agent_core::SubagentTool {
         llm: llm.clone(),
         tools: Arc::new(ToolRegistry::new(sub_tools)),
-        max_turns: 8,
+        max_turns: config.agent.subagent_max_turns.unwrap_or(8).max(1),
+        slots: tokio::sync::Semaphore::new(
+            config.agent.subagent_max_concurrency.unwrap_or(2).max(1),
+        ),
         system_prompt: include_str!("../../../prompts/subagent.md").to_string(),
         generation: generation.clone(),
     }));
 
     let registry = Arc::new(ToolRegistry::new(tools));
+    let mut deferred_tools: HashSet<String> = config
+        .agent
+        .deferred_tools
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    if config.agent.defer_mcp_tools.unwrap_or(false) {
+        deferred_tools.extend(
+            registry
+                .names()
+                .into_iter()
+                .filter(|name| name.starts_with("mcp__")),
+        );
+    }
+    deferred_tools.remove("tool_search");
 
     let mode = if args.plan {
         Mode::Plan
@@ -317,23 +338,61 @@ async fn main() -> Result<()> {
             vision,
             context_window,
             max_turns,
+            compact_ratio: config.agent.compact_ratio.unwrap_or(0.9),
+            compact_window: config.agent.compact_window,
             system_prompt,
             generation: generation.clone(),
             skills: skill_catalog.summaries(),
             pre_tool_use: config.hooks.pre_tool_use.clone(),
             post_tool_use: config.hooks.post_tool_use.clone(),
+            stop_hooks: config.hooks.stop.clone(),
+            pre_compact_hooks: config.hooks.pre_compact.clone(),
+            post_compact_hooks: config.hooks.post_compact.clone(),
+            reminder_policy: ReminderPolicy {
+                todo_after_turns: config.agent.todo_reminder_after.unwrap_or(10).max(1),
+                todo_interval_turns: config.agent.todo_reminder_interval.unwrap_or(10).max(1),
+            },
             permissions_file: Some(permissions_path.clone()),
         },
         cancel: cancel.clone(),
         queue: queue.clone(),
         read_ledger,
+        deferred_tools,
+        discovered_tools: HashSet::new(),
     };
     agent.emit(Event::SessionStarted {
         session_id: session_id.clone(),
         model: model.clone(),
     });
 
-    if let Some(prompt) = args.print.clone() {
+    let session_start_payload = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": session_id.clone(),
+        "transcript_path": transcript_path.clone(),
+        "cwd": cwd.display().to_string(),
+        "model": model.clone(),
+    });
+    for failure in run_lifecycle_hooks(
+        &config.hooks.session_start,
+        &cwd,
+        "SessionStart",
+        "session_start",
+        session_start_payload,
+    )
+    .await
+    {
+        agent.emit(Event::Notice { message: failure });
+    }
+
+    let session_end_payload = serde_json::json!({
+        "hook_event_name": "SessionEnd",
+        "session_id": session_id.clone(),
+        "transcript_path": transcript_path.clone(),
+        "cwd": cwd.display().to_string(),
+        "model": model.clone(),
+    });
+
+    let result = if let Some(prompt) = args.print.clone() {
         run_headless(agent, prompt, event_rx, args.output_format == "stream-json").await
     } else {
         run_interactive(
@@ -352,7 +411,20 @@ async fn main() -> Result<()> {
             tui,
         )
         .await
+    };
+
+    for failure in run_lifecycle_hooks(
+        &config.hooks.session_end,
+        &cwd,
+        "SessionEnd",
+        "session_end",
+        session_end_payload,
+    )
+    .await
+    {
+        eprintln!("warning: {failure}");
     }
+    result
 }
 
 fn load_env_files() {
@@ -575,8 +647,14 @@ async fn run_headless(
                 Event::TurnFinished {
                     prompt_tokens,
                     completion_tokens,
+                    terminal_reason,
                     ..
-                } => eprintln!("— tokens in {prompt_tokens} / out {completion_tokens}"),
+                } => {
+                    eprintln!("— tokens in {prompt_tokens} / out {completion_tokens}");
+                    if terminal_reason != TerminalReason::Complete {
+                        eprintln!("terminal: {}", terminal_reason.as_str());
+                    }
+                }
                 _ => {}
             }
         }

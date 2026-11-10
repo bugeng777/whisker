@@ -12,14 +12,19 @@ plan mode, context compaction).
 - **OpenAI-compatible providers** with streaming SSE, tool-call assembly, retries,
   and a configurable `reasoning_content` policy (DeepSeek reasoner friendly).
 - **Native tools**: `read`, `write`, `edit`, `glob`, `grep`, `bash` (tree-sitter safety
-  analysis), `open_app`, `todo_write`, `ask_user`, `skill`, `lsp`.
+  analysis), `open_app`, `todo_write`, `ask_user`, `skill`, `lsp`. Tools can be deferred
+  behind `tool_search` (`deferred_tools` / `defer_mcp_tools`) to keep large MCP sets
+  out of the prompt.
 - **Harness invariants**: read-before-edit is a hard gate; destructive commands require
   approval; plan mode is read-only; event-driven reminders cover todos and verification.
+  Todo reminders use the validated 10/10 turn policy, fire only when `todo_write` is
+  available, and are configurable via `todo_reminder_after` / `todo_reminder_interval`.
 - **Loop termination**: the loop waits for the provider finish reason — `stop` / no tool
   calls completes, `tool_calls` executes and continues, `max_tokens` ends with a notice.
   `max_turns` is optional; omit it to let the model decide when to stop.
 - **Subagents**: `agent` tool runs a read-only exploration loop with an isolated context
-  and returns a concise report.
+  and returns a concise report. Depth is fixed at 1; turns and concurrency are capped by
+  `subagent_max_turns` / `subagent_max_concurrency`.
 - **Skills**: markdown procedures loaded on demand from `.whisker/skills` or `.claude/skills`.
 - **MCP**: stdio and Streamable HTTP sidecars share the same approval/truncation pipeline.
 - **Vision**: models declared with `vision = true` (for example `deepseek-flash`) receive
@@ -40,7 +45,8 @@ plan mode, context compaction).
   66-column welcome box, with the conversation full-width below. The cat switches
   between idle / scanning / working / purring poses (whiskers, pupils, purr waves)
   and `/cat <pose>` pins one for a few seconds. `/config` opens a Claude-style
-  settings page with searchable tabs for settings, status and token usage.
+  settings page with searchable tabs for settings, status and token usage. The
+  header rotates one tip per prompt and shows thinking, stall and tool timers.
 
 ## Build and install
 
@@ -92,10 +98,11 @@ Provider selection: `--profile`, `[agent] profile`, or the built-in DeepSeek def
   [n] deny + feedback`. "Always" rules are appended to `~/.whisker/permissions.allow`.
 - **Plan mode**: only read-only tools are available. The plan is stored in `plan.md` and
   re-injected after context compaction.
-- **Reminders**: if a multi-step task has no todo list, or edits are unverified, the
-  harness injects a one-shot system reminder.
-- **Context**: tool output over 32K chars spills to disk; context is compacted at 70% of
-  the window (CJK-aware token estimation).
+- **Reminders**: todo reminders follow the 10/10 turn policy; unverified edits still
+  produce a one-shot verification reminder.
+- **Context**: tool output over 32K chars spills to disk; context auto-compacts at 90%
+  of the configured window (`compact_ratio`) or at an absolute `compact_window` token
+  count. Token estimation is CJK-aware.
 
 ## Slash commands
 
@@ -136,11 +143,26 @@ procedure when a task matches.
 [hooks]
 pre_tool_use = ["...shell command..."]
 post_tool_use = ["..."]
+stop = ["..."]
 ```
 
 The args are passed as JSON on stdin and in `WHISKER_TOOL_ARGS`; `WHISKER_TOOL_NAME` and
 `WHISKER_HOOK_PHASE` are set. A non-zero pre-hook blocks the tool; a non-zero post-hook marks
-the result as failed.
+the result as failed. The pre-hook runs before the permission check, so a denied call still
+triggers `pre_tool_use` but never `post_tool_use`.
+
+The `stop` hook runs once when the model finishes without tool calls. It receives
+`{"hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"...",
+"terminal_reason":"completed"}` on stdin plus `WHISKER_HOOK_EVENT` and
+`WHISKER_STOP_HOOK_ACTIVE`. Printing a JSON line with `"decision":"block"` and a `reason`
+asks for one more model turn; a second block ends the turn with a notice. `stop_hook_active`
+is true on that continuation, mirroring Claude Code.
+
+Lifecycle hooks are observational and never block: `session_start`, `session_end`,
+`pre_compact`, `post_compact`. They receive `hook_event_name`, `session_id`,
+`transcript_path`, `cwd`, and `model` on stdin; compaction hooks add `trigger`
+(`auto`/`manual`) and `post_compact` adds `messages_removed`. Failures surface as
+notices (or stderr after the session ends).
 
 ## MCP sidecars
 

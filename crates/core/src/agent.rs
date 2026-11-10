@@ -1,5 +1,5 @@
-use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::collections::{HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -11,19 +11,109 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::cancel::CancelHandle;
-use crate::context::{Mode, TodoItem, TodoStatus};
+use crate::context::{Mode, ReminderPolicy, TodoItem, TodoStatus};
 use crate::llm::LlmClient;
 use crate::policy::{rule_key, ApprovalDecision, ApprovalRequest, Decision, Interactor, Policy};
 use crate::session::SessionStore;
 use crate::tool::{ProgressSink, ReadLedger, Tool, ToolCtx, ToolOutput, ToolRegistry};
 use crate::types::{
-    ChatRequest, Event, FinishReason, GenerationSettings, Message, StreamEvent, ToolCall, Usage,
+    ChatRequest, Event, FinishReason, GenerationSettings, Message, StreamEvent, TerminalReason,
+    ToolCall, ToolSpec, Usage,
 };
 
 pub const MAX_TOOL_RESULT_CHARS: usize = 32 * 1024;
 const PREVIEW_CHARS: usize = 16 * 1024;
-const COMPACT_RATIO: f64 = 0.7;
 const TOOL_TIMEOUT: Duration = Duration::from_secs(600);
+
+fn compact_threshold(context_window: usize, compact_window: Option<usize>, ratio: f64) -> usize {
+    if let Some(window) = compact_window {
+        return window.max(1_024);
+    }
+    ((context_window as f64) * ratio.clamp(0.1, 0.99)) as usize
+}
+
+fn tool_search_spec() -> ToolSpec {
+    ToolSpec {
+        name: "tool_search".to_string(),
+        description: "Search deferred tools by capability and make them available for the next turn. Use this when a needed tool is not in the current tool list.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Capability or keywords, for example 'read file' or 'browser screenshot'"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum tools to return (default 5, max 20)"
+                }
+            },
+            "required": ["query"]
+        }),
+    }
+}
+
+fn tool_match_score(name: &str, description: &str, terms: &[String]) -> Option<usize> {
+    let name = name.to_ascii_lowercase();
+    let haystack = format!("{name} {}", description.to_ascii_lowercase());
+    let mut score = 0;
+    for term in terms {
+        if !haystack.contains(term.as_str()) {
+            return None;
+        }
+        score += if name.contains(term.as_str()) { 2 } else { 1 };
+    }
+    Some(score)
+}
+
+pub async fn run_lifecycle_hooks(
+    commands: &[String],
+    cwd: &Path,
+    event: &str,
+    phase: &str,
+    payload: serde_json::Value,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    let payload_json = format!("{payload}\n");
+    for command in commands {
+        let mut child = match tokio::process::Command::new("bash")
+            .arg("-lc")
+            .arg(command)
+            .current_dir(cwd)
+            .env("WHISKER_HOOK_PHASE", phase)
+            .env("WHISKER_HOOK_EVENT", event)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(err) => {
+                failures.push(format!("{event} hook failed to spawn: {err}"));
+                continue;
+            }
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            if let Err(err) = stdin.write_all(payload_json.as_bytes()).await {
+                failures.push(format!("{event} hook stdin failed: {err}"));
+                continue;
+            }
+        }
+        match tokio::time::timeout(Duration::from_secs(30), child.wait_with_output()).await {
+            Ok(Ok(output)) if output.status.success() => {}
+            Ok(Ok(output)) => failures.push(format!(
+                "{event} hook exited with {}: {}{}",
+                output.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+            Ok(Err(err)) => failures.push(format!("{event} hook failed: {err}")),
+            Err(_) => failures.push(format!("{event} hook timed out after 30s")),
+        }
+    }
+    failures
+}
 
 pub struct AgentConfig {
     pub model: String,
@@ -32,11 +122,19 @@ pub struct AgentConfig {
     pub context_window: usize,
     /// Optional safety cap. `None` waits for the model's finish signal.
     pub max_turns: Option<u32>,
+    /// Fraction of the context window that triggers auto-compaction.
+    pub compact_ratio: f64,
+    /// Absolute token threshold overriding `compact_ratio`.
+    pub compact_window: Option<usize>,
     pub system_prompt: String,
     pub generation: GenerationSettings,
     pub skills: Vec<(String, String)>,
     pub pre_tool_use: Vec<String>,
     pub post_tool_use: Vec<String>,
+    pub stop_hooks: Vec<String>,
+    pub pre_compact_hooks: Vec<String>,
+    pub post_compact_hooks: Vec<String>,
+    pub reminder_policy: ReminderPolicy,
     pub permissions_file: Option<PathBuf>,
 }
 
@@ -51,6 +149,8 @@ pub struct Agent {
     pub cancel: CancelHandle,
     pub queue: Arc<Mutex<VecDeque<String>>>,
     pub read_ledger: ReadLedger,
+    pub deferred_tools: HashSet<String>,
+    pub discovered_tools: HashSet<String>,
 }
 
 struct PreparedCall {
@@ -149,11 +249,14 @@ impl Agent {
         let token = self.cancel.token();
         let usage_before = self.session.state.usage.clone();
         let mut turn = 0u32;
+        let mut terminal_reason = TerminalReason::Complete;
+        let mut stop_hook_active = false;
 
         loop {
             turn += 1;
             if let Some(max_turns) = self.config.max_turns {
                 if turn > max_turns.max(1) {
+                    terminal_reason = TerminalReason::MaxTurns;
                     self.emit(Event::Error {
                         message: format!("max turns ({max_turns}) reached"),
                     });
@@ -172,6 +275,7 @@ impl Agent {
                 }
             }
             if token.is_cancelled() {
+                terminal_reason = TerminalReason::Interrupted;
                 self.emit(Event::Interrupted);
                 break;
             }
@@ -180,7 +284,7 @@ impl Agent {
 
             let request = ChatRequest {
                 messages: self.build_messages(),
-                tools: self.tools.specs(),
+                tools: self.request_tools(),
                 generation: self.config.generation.clone(),
             };
 
@@ -188,8 +292,10 @@ impl Agent {
                 Ok(value) => value,
                 Err(err) => {
                     if err.to_string() == "cancelled" {
+                        terminal_reason = TerminalReason::Interrupted;
                         self.emit(Event::Interrupted);
                     } else {
+                        terminal_reason = TerminalReason::Error;
                         self.emit(Event::Error {
                             message: err.to_string(),
                         });
@@ -232,8 +338,10 @@ impl Agent {
                 content: assistant_text.clone(),
                 tool_calls: calls.clone(),
             });
+            self.session.state.ctx.on_assistant_turn();
 
             if matches!(finish, Some(FinishReason::MaxTokens)) {
+                terminal_reason = TerminalReason::MaxTokens;
                 self.emit(Event::Notice {
                     message: "model reached its output token limit; ending turn".to_string(),
                 });
@@ -245,12 +353,42 @@ impl Agent {
                     self.session.state.plan = Some(assistant_text.clone());
                     let _ = std::fs::write(self.session.dir.join("plan.md"), &assistant_text);
                 }
+                let at_turn_cap = self
+                    .config
+                    .max_turns
+                    .is_some_and(|max_turns| turn >= max_turns.max(1));
+                if !at_turn_cap && !self.config.stop_hooks.is_empty() {
+                    match self.run_stop_hooks(&assistant_text, stop_hook_active).await {
+                        Ok(Some(reason)) if !stop_hook_active => {
+                            stop_hook_active = true;
+                            self.emit(Event::Notice {
+                                message: format!("stop hook blocked: {reason}"),
+                            });
+                            self.session.state.messages.push(Message::user(format!(
+                                "<system-reminder>\nStop hook requested continuation: {reason}\n</system-reminder>"
+                            )));
+                            continue;
+                        }
+                        Ok(Some(reason)) => {
+                            self.emit(Event::Notice {
+                                message: format!("stop hook blocked again; ending turn: {reason}"),
+                            });
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            self.emit(Event::Notice {
+                                message: format!("stop hook failed: {err}"),
+                            });
+                        }
+                    }
+                }
                 break;
             }
 
             self.execute_tool_calls(&calls, &token).await;
 
             if token.is_cancelled() {
+                terminal_reason = TerminalReason::Interrupted;
                 self.emit(Event::Interrupted);
                 break;
             }
@@ -271,6 +409,7 @@ impl Agent {
                 .usage
                 .completion_tokens
                 .saturating_sub(usage_before.completion_tokens),
+            terminal_reason,
         });
         Ok(())
     }
@@ -288,8 +427,76 @@ impl Agent {
         }
     }
 
+    fn request_tools(&self) -> Vec<ToolSpec> {
+        let mut specs: Vec<ToolSpec> = self
+            .tools
+            .all()
+            .iter()
+            .filter(|tool| {
+                !self.deferred_tools.contains(tool.name())
+                    || self.discovered_tools.contains(tool.name())
+            })
+            .map(|tool| tool.spec())
+            .collect();
+        if !self.deferred_tools.is_empty() {
+            specs.push(tool_search_spec());
+        }
+        specs
+    }
+
+    fn search_deferred_tools(&mut self, args: &serde_json::Value) -> ToolOutput {
+        let query = args
+            .get("query")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let terms: Vec<String> = query.split_whitespace().map(str::to_string).collect();
+        let limit = args
+            .get("limit")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(5)
+            .clamp(1, 20) as usize;
+
+        let mut matches: Vec<(usize, String, String)> = self
+            .tools
+            .all()
+            .iter()
+            .filter(|tool| self.deferred_tools.contains(tool.name()))
+            .filter_map(|tool| {
+                tool_match_score(tool.name(), tool.description(), &terms).map(|score| {
+                    (
+                        score,
+                        tool.name().to_string(),
+                        tool.description().to_string(),
+                    )
+                })
+            })
+            .collect();
+        matches.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        matches.truncate(limit);
+
+        if matches.is_empty() {
+            return ToolOutput::ok(format!("No deferred tools matched '{query}'."));
+        }
+        for (_, name, _) in &matches {
+            self.discovered_tools.insert(name.clone());
+        }
+        let mut text = format!("Found {} deferred tool(s):\n", matches.len());
+        for (_, name, description) in &matches {
+            text.push_str(&format!("- {name}: {description}\n"));
+        }
+        text.push_str("They are now available; call them directly on your next turn.");
+        ToolOutput::ok(text)
+    }
+
     fn inject_reminders(&mut self) {
-        let due = self.session.state.ctx.due_reminders();
+        let todo_tool_available = self.tools.get("todo_write").is_some();
+        let due = self
+            .session
+            .state
+            .ctx
+            .due_reminders(todo_tool_available, self.config.reminder_policy);
         for (kind, text) in due {
             self.emit(Event::Reminder {
                 kind,
@@ -400,6 +607,19 @@ impl Agent {
                 args: args.clone(),
             });
 
+            if name == "tool_search" && !self.deferred_tools.is_empty() {
+                let output = self.search_deferred_tools(&args);
+                self.finish_tool_call(call, &name, args.clone(), output, None);
+                continue;
+            }
+            if self.deferred_tools.contains(&name) && !self.discovered_tools.contains(&name) {
+                let output = ToolOutput::err(format!(
+                    "Tool '{name}' is deferred. Use tool_search to discover it first."
+                ));
+                self.finish_tool_call(call, &name, args.clone(), output, None);
+                continue;
+            }
+
             let tool = match self.tools.get(&name) {
                 Some(tool) => tool,
                 None => {
@@ -424,6 +644,18 @@ impl Agent {
                 let output = ToolOutput::err(message);
                 self.finish_tool_call(call, &name, args.clone(), output, None);
                 continue;
+            }
+
+            if !self.config.pre_tool_use.is_empty() {
+                if let Some(failure) = self
+                    .run_hooks(&self.config.pre_tool_use, "pre_tool_use", &name, &args)
+                    .await
+                {
+                    let output =
+                        ToolOutput::err(format!("Blocked by pre_tool_use hook: {failure}"));
+                    self.finish_tool_call(call, &name, args.clone(), output, None);
+                    continue;
+                }
             }
 
             let decision = {
@@ -481,19 +713,6 @@ impl Agent {
                 }
             }
 
-            if !self.config.pre_tool_use.is_empty() {
-                if let Some(failure) = self
-                    .run_hooks(&self.config.pre_tool_use, "pre_tool_use", &name, &args)
-                    .await
-                {
-                    let output =
-                        ToolOutput::err(format!("Blocked by pre_tool_use hook: {failure}"));
-                    self.finish_tool_call(call, &name, args.clone(), output, None);
-                    continue;
-                }
-            }
-
-            self.session.state.ctx.on_tool_call();
             let sink = ProgressSink::new(self.events.clone(), call.id.clone(), name.clone());
             prepared.push(PreparedCall { tool, args, sink });
 
@@ -701,6 +920,71 @@ impl Agent {
         }
     }
 
+    async fn run_stop_hooks(
+        &self,
+        last_message: &str,
+        stop_hook_active: bool,
+    ) -> Result<Option<String>, String> {
+        let payload = serde_json::json!({
+            "hook_event_name": "Stop",
+            "stop_hook_active": stop_hook_active,
+            "last_assistant_message": last_message,
+            "terminal_reason": "completed",
+        });
+        let payload_json = format!("{payload}\n");
+        for command in &self.config.stop_hooks {
+            let mut child = match tokio::process::Command::new("bash")
+                .arg("-lc")
+                .arg(command)
+                .current_dir(&self.config.cwd)
+                .env("WHISKER_HOOK_PHASE", "stop")
+                .env("WHISKER_HOOK_EVENT", "Stop")
+                .env(
+                    "WHISKER_STOP_HOOK_ACTIVE",
+                    if stop_hook_active { "1" } else { "0" },
+                )
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(err) => return Err(format!("stop hook failed to spawn: {err}")),
+            };
+
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin
+                    .write_all(payload_json.as_bytes())
+                    .await
+                    .map_err(|err| format!("stop hook stdin failed: {err}"))?;
+            }
+
+            match tokio::time::timeout(Duration::from_secs(30), child.wait_with_output()).await {
+                Ok(Ok(output)) if output.status.success() => {
+                    if let Some(reason) =
+                        parse_stop_hook_output(&String::from_utf8_lossy(&output.stdout))
+                    {
+                        return Ok(Some(reason));
+                    }
+                }
+                Ok(Ok(output)) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(format!(
+                        "stop hook exited with {}\n{}{}",
+                        output.status.code().unwrap_or(-1),
+                        stdout.trim(),
+                        stderr.trim()
+                    ));
+                }
+                Ok(Err(err)) => return Err(format!("stop hook failed: {err}")),
+                Err(_) => return Err("stop hook timed out after 30s".to_string()),
+            }
+        }
+        Ok(None)
+    }
+
     async fn run_hooks(
         &self,
         commands: &[String],
@@ -778,7 +1062,12 @@ impl Agent {
     async fn compact_if_needed(&mut self, force: bool, token: &CancellationToken) -> Result<()> {
         let total = estimate_messages(&self.session.state.messages)
             + estimate_text(&self.config.system_prompt);
-        if !force && (total as f64) < self.config.context_window as f64 * COMPACT_RATIO {
+        let threshold = compact_threshold(
+            self.config.context_window,
+            self.config.compact_window,
+            self.config.compact_ratio,
+        );
+        if !force && total < threshold {
             return Ok(());
         }
         let length = self.session.state.messages.len();
@@ -806,6 +1095,27 @@ impl Agent {
             }
             return Ok(());
         }
+        let trigger = if force { "manual" } else { "auto" };
+        let pre_payload = serde_json::json!({
+            "hook_event_name": "PreCompact",
+            "session_id": self.session.state.id,
+            "transcript_path": self.session.dir.join("events.jsonl").display().to_string(),
+            "cwd": self.config.cwd.display().to_string(),
+            "model": self.config.model,
+            "trigger": trigger,
+        });
+        for failure in run_lifecycle_hooks(
+            &self.config.pre_compact_hooks,
+            &self.config.cwd,
+            "PreCompact",
+            "pre_compact",
+            pre_payload,
+        )
+        .await
+        {
+            self.emit(Event::Notice { message: failure });
+        }
+
         let old: Vec<Message> = self.session.state.messages.drain(0..split).collect();
         let transcript = render_transcript(&old);
         let request = ChatRequest {
@@ -842,6 +1152,27 @@ impl Agent {
             .messages
             .insert(0, Message::user(reminder));
         self.emit(Event::Compacted { removed: split });
+
+        let post_payload = serde_json::json!({
+            "hook_event_name": "PostCompact",
+            "session_id": self.session.state.id,
+            "transcript_path": self.session.dir.join("events.jsonl").display().to_string(),
+            "cwd": self.config.cwd.display().to_string(),
+            "model": self.config.model,
+            "trigger": trigger,
+            "messages_removed": split,
+        });
+        for failure in run_lifecycle_hooks(
+            &self.config.post_compact_hooks,
+            &self.config.cwd,
+            "PostCompact",
+            "post_compact",
+            post_payload,
+        )
+        .await
+        {
+            self.emit(Event::Notice { message: failure });
+        }
         Ok(())
     }
 
@@ -1090,6 +1421,28 @@ fn estimate_text(text: &str) -> usize {
     (cjk as f64 / 1.5 + other as f64 / 3.5).ceil() as usize
 }
 
+fn parse_stop_hook_output(stdout: &str) -> Option<String> {
+    for line in stdout.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("decision").and_then(|value| value.as_str()) == Some("block") {
+            return Some(
+                value
+                    .get("reason")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("stop hook blocked")
+                    .to_string(),
+            );
+        }
+    }
+    None
+}
+
 fn is_cjk(ch: char) -> bool {
     matches!(
         ch as u32,
@@ -1121,4 +1474,68 @@ fn estimate_messages(messages: &[Message]) -> usize {
             Message::Tool { content, .. } => estimate_text(content),
         })
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        compact_threshold, parse_stop_hook_output, run_lifecycle_hooks, tool_match_score,
+        tool_search_spec,
+    };
+
+    #[tokio::test]
+    async fn lifecycle_hook_failures_are_reported_without_stopping() {
+        let commands = vec!["exit 7".to_string(), "true".to_string()];
+        let failures = run_lifecycle_hooks(
+            &commands,
+            std::path::Path::new("."),
+            "TestEvent",
+            "test",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("exited with 7"));
+    }
+
+    #[test]
+    fn parses_stop_hook_block_decision() {
+        assert_eq!(
+            parse_stop_hook_output("{\"decision\":\"block\",\"reason\":\"continue\"}"),
+            Some("continue".to_string())
+        );
+        assert_eq!(
+            parse_stop_hook_output("log line\n{\"decision\":\"block\"}"),
+            Some("stop hook blocked".to_string())
+        );
+        assert_eq!(parse_stop_hook_output("{\"decision\":\"allow\"}"), None);
+        assert_eq!(parse_stop_hook_output("not json"), None);
+    }
+
+    #[test]
+    fn tool_search_matches_all_terms_and_prefers_names() {
+        let terms = vec!["read".to_string(), "file".to_string()];
+        assert!(tool_match_score("read", "Read a file from disk", &terms).is_some());
+        assert!(tool_match_score("write", "Write a file", &terms).is_none());
+        let named = tool_match_score("read_file", "Reads a file", &terms).expect("named");
+        let described = tool_match_score("fs", "read file helper", &terms).expect("described");
+        assert!(named > described);
+    }
+
+    #[test]
+    fn tool_search_spec_exposes_query() {
+        let spec = tool_search_spec();
+        assert_eq!(spec.name, "tool_search");
+        assert_eq!(spec.parameters["required"][0], "query");
+    }
+
+    #[test]
+    fn compact_threshold_matches_validated_ratio() {
+        assert_eq!(compact_threshold(200_000, None, 0.9), 180_000);
+        assert_eq!(compact_threshold(1_048_576, None, 0.9), 943_718);
+        assert_eq!(compact_threshold(200_000, Some(150_000), 0.9), 150_000);
+        assert_eq!(compact_threshold(200_000, None, 2.0), 198_000);
+        assert_eq!(compact_threshold(200_000, None, 0.0), 20_000);
+        assert_eq!(compact_threshold(200_000, Some(10), 0.9), 1_024);
+    }
 }
