@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agent_core::{
-    ApprovalDecision, ApprovalRequest, CancelHandle, Event, GenerationSettings, TodoItem,
-    TodoStatus,
+    ApprovalDecision, ApprovalRequest, CancelHandle, Event, GenerationSettings, ModelSettings,
+    ModelSettingsStore, TodoItem, TodoStatus,
 };
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -35,29 +35,11 @@ const RED: Color = Color::Rgb(255, 100, 100);
 const YELLOW: Color = Color::Rgb(230, 190, 80);
 const SETTINGS_COL_WIDTH: usize = 47;
 const SETTINGS_TABS: &[&str] = &["Settings", "Status", "Usage"];
-const DEEPSEEK_SETTINGS_TABS: &[&str] = &["Settings", "DeepSeek", "Status", "Usage"];
 const DEEPSEEK_EFFORTS: &[&str] = &["low", "high", "max"];
 const MAX_TOKEN_PRESETS: &[Option<u32>] =
     &[None, Some(8_192), Some(32_768), Some(65_536), Some(131_072)];
 const TEMPERATURE_PRESETS: &[f32] = &[0.0, 0.2, 0.5, 1.0, 1.5, 2.0];
-
-fn settings_tabs(deepseek: bool) -> &'static [&'static str] {
-    if deepseek {
-        DEEPSEEK_SETTINGS_TABS
-    } else {
-        SETTINGS_TABS
-    }
-}
-
-fn deepseek_settings_path() -> PathBuf {
-    std::env::var_os("WHISKER_DEEPSEEK_SETTINGS")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|home| PathBuf::from(home).join(".whisker/deepseek-settings.json"))
-        })
-        .unwrap_or_else(|| PathBuf::from(".whisker/deepseek-settings.json"))
-}
+const CONTEXT_PRESETS: &[usize] = &[128_000, 256_000, 524_288, 1_048_576];
 
 fn max_tokens_label(value: Option<u32>) -> String {
     match value {
@@ -98,6 +80,14 @@ fn cycle_effort(value: &str) -> String {
         .position(|candidate| candidate.eq_ignore_ascii_case(value))
         .unwrap_or(1);
     DEEPSEEK_EFFORTS[(index + 1) % DEEPSEEK_EFFORTS.len()].to_string()
+}
+
+fn cycle_context_window(value: usize) -> usize {
+    let index = CONTEXT_PRESETS
+        .iter()
+        .position(|candidate| *candidate == value)
+        .unwrap_or(CONTEXT_PRESETS.len() - 1);
+    CONTEXT_PRESETS[(index + 1) % CONTEXT_PRESETS.len()]
 }
 
 fn context_label(context: usize) -> String {
@@ -146,10 +136,6 @@ enum SettingAction {
     ToggleTips,
     ToggleMotion,
     OpenModelPicker,
-    ToggleThinking,
-    CycleEffort,
-    CycleMaxTokens,
-    CycleTemperature,
 }
 
 struct SettingRow {
@@ -171,12 +157,35 @@ struct PickerOption {
     current: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PickerFocus {
+    Models,
+    Settings,
+}
+
 struct PickerState {
     kind: PickerKind,
     title: String,
     subtitle: String,
     options: Vec<PickerOption>,
     selected: usize,
+    focus: PickerFocus,
+    settings_selected: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModelSettingAction {
+    ToggleThinking,
+    CycleEffort,
+    CycleMaxTokens,
+    CycleTemperature,
+    CycleContext,
+}
+
+struct ModelSettingRow {
+    label: String,
+    value: String,
+    action: ModelSettingAction,
 }
 
 struct TuiState {
@@ -185,13 +194,15 @@ struct TuiState {
     ask_input: String,
     busy: bool,
     spinner: usize,
+    spinner_verb: String,
     mode: String,
     model: String,
     models: Vec<String>,
     generation: GenerationSettings,
     context_window: usize,
     deepseek_mode: bool,
-    deepseek_settings_path: PathBuf,
+    model_settings: ModelSettingsStore,
+    model_settings_path: PathBuf,
     picker: Option<PickerState>,
     todos: Vec<TodoItem>,
     total_in: u32,
@@ -223,13 +234,15 @@ impl TuiState {
             ask_input: String::new(),
             busy: false,
             spinner: 0,
+            spinner_verb: brand::random_verb().to_string(),
             mode,
             model: String::new(),
             models: Vec::new(),
             generation: GenerationSettings::default(),
             context_window: 0,
             deepseek_mode: false,
-            deepseek_settings_path: deepseek_settings_path(),
+            model_settings: ModelSettingsStore::default(),
+            model_settings_path: ModelSettingsStore::default_path(),
             picker: None,
             todos: Vec::new(),
             total_in: 0,
@@ -271,6 +284,21 @@ impl TuiState {
             Pose::Success
         } else {
             Pose::Idle
+        }
+    }
+
+    fn activity_word(&self, max_chars: usize) -> String {
+        let raw = self
+            .todos
+            .iter()
+            .find(|todo| todo.status == TodoStatus::InProgress)
+            .map(|todo| todo.content.as_str())
+            .unwrap_or(self.spinner_verb.as_str());
+        let one_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        if one_line.is_empty() {
+            "Working".to_string()
+        } else {
+            truncate(&one_line, max_chars)
         }
     }
 
@@ -512,9 +540,7 @@ fn setting_rows(state: &TuiState, tab: usize, model: &str, session: &str) -> Vec
     } else {
         state.model.clone()
     };
-    let deepseek_tab = state.deepseek_mode;
-    let status_tab = if deepseek_tab { 2 } else { 1 };
-    let usage_tab = if deepseek_tab { 3 } else { 2 };
+    let deepseek_mode = state.deepseek_mode;
     let thinking = match state.generation.thinking {
         Some(true) => "on",
         Some(false) => "off",
@@ -549,35 +575,7 @@ fn setting_rows(state: &TuiState, tab: usize, model: &str, session: &str) -> Vec
             ),
             row("Session", session.to_string(), None),
         ],
-        1 if deepseek_tab => vec![
-            row(
-                "Model",
-                effective_model,
-                Some(SettingAction::OpenModelPicker),
-            ),
-            row(
-                "Thinking",
-                thinking.to_string(),
-                Some(SettingAction::ToggleThinking),
-            ),
-            row(
-                "Reasoning effort",
-                effort.clone(),
-                Some(SettingAction::CycleEffort),
-            ),
-            row(
-                "Max output tokens",
-                max_tokens_label(state.generation.max_tokens),
-                Some(SettingAction::CycleMaxTokens),
-            ),
-            row(
-                "Temperature",
-                temperature_label(state.generation.temperature),
-                Some(SettingAction::CycleTemperature),
-            ),
-            row("Context window", context_label(state.context_window), None),
-        ],
-        t if t == status_tab => {
+        1 => {
             let status = if state.busy {
                 if state.scanning {
                     "scanning"
@@ -589,22 +587,25 @@ fn setting_rows(state: &TuiState, tab: usize, model: &str, session: &str) -> Vec
             } else {
                 "ready"
             };
-            vec![
+            let mut rows = vec![
                 row("Session", session.to_string(), None),
                 row("Model", effective_model, None),
                 row("Mode", state.mode.clone(), None),
                 row("State", status.to_string(), None),
-                row("Thinking", thinking.to_string(), None),
-                row("Reasoning effort", effort, None),
-                row(
-                    "Tokens",
-                    format!("{} / {}", state.total_in, state.total_out),
-                    None,
-                ),
-                row("Turns", state.turns.to_string(), None),
-            ]
+            ];
+            if deepseek_mode {
+                rows.push(row("Thinking", thinking.to_string(), None));
+                rows.push(row("Reasoning effort", effort, None));
+            }
+            rows.push(row(
+                "Tokens",
+                format!("{} / {}", state.total_in, state.total_out),
+                None,
+            ));
+            rows.push(row("Turns", state.turns.to_string(), None));
+            rows
         }
-        t if t == usage_tab => vec![
+        _ if tab == 2 => vec![
             row("Input tokens", state.total_in.to_string(), None),
             row("Output tokens", state.total_out.to_string(), None),
             row(
@@ -668,47 +669,7 @@ fn apply_setting(
             state.settings = None;
             open_model_picker(state);
         }
-        SettingAction::ToggleThinking => {
-            update_generation(state, cmd_tx, |generation| {
-                generation.thinking = Some(match generation.thinking {
-                    Some(true) => false,
-                    Some(false) => true,
-                    None => false,
-                });
-            });
-        }
-        SettingAction::CycleEffort => {
-            update_generation(state, cmd_tx, |generation| {
-                let current = generation
-                    .reasoning_effort
-                    .clone()
-                    .unwrap_or_else(|| "high".to_string());
-                generation.reasoning_effort = Some(cycle_effort(&current));
-            });
-        }
-        SettingAction::CycleMaxTokens => {
-            update_generation(state, cmd_tx, |generation| {
-                generation.max_tokens = cycle_max_tokens(generation.max_tokens);
-            });
-        }
-        SettingAction::CycleTemperature => {
-            update_generation(state, cmd_tx, |generation| {
-                generation.temperature = cycle_temperature(generation.temperature);
-            });
-        }
     }
-}
-
-fn update_generation(
-    state: &mut TuiState,
-    cmd_tx: &mpsc::UnboundedSender<Command>,
-    update: impl FnOnce(&mut GenerationSettings),
-) {
-    let mut generation = state.generation.clone();
-    update(&mut generation);
-    state.generation = generation.clone();
-    let _ = generation.save(&state.deepseek_settings_path);
-    let _ = cmd_tx.send(Command::SetGeneration(generation));
 }
 
 fn handle_settings_key(
@@ -721,7 +682,7 @@ fn handle_settings_key(
     let Some(mut page) = state.settings.take() else {
         return;
     };
-    let tab_count = settings_tabs(state.deepseek_mode).len();
+    let tab_count = SETTINGS_TABS.len();
     let rows = filtered_setting_rows(&page, state, model, session);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -904,6 +865,7 @@ pub async fn run_tui(
     state.generation = generation;
     state.context_window = context_window;
     state.deepseek_mode = deepseek_mode;
+    state.model_settings = ModelSettingsStore::load(&state.model_settings_path).unwrap_or_default();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -1060,32 +1022,222 @@ fn handle_key(
     false
 }
 
+fn highlighted_model(state: &TuiState) -> Option<String> {
+    let picker = state.picker.as_ref()?;
+    let option = picker.options.get(picker.selected)?;
+    if option.value.is_empty() {
+        None
+    } else {
+        Some(option.value.clone())
+    }
+}
+
+fn model_settings_for(state: &TuiState, model: &str) -> ModelSettings {
+    state
+        .model_settings
+        .get(model)
+        .cloned()
+        .unwrap_or_else(|| ModelSettings {
+            generation: state.generation.clone(),
+            context_window: Some(state.context_window),
+        })
+}
+
+fn model_setting_rows(state: &TuiState, model: &str) -> Vec<ModelSettingRow> {
+    let settings = model_settings_for(state, model);
+    let thinking = match settings.generation.thinking {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "auto",
+    };
+    let effort = settings
+        .generation
+        .reasoning_effort
+        .clone()
+        .unwrap_or_else(|| "auto".to_string());
+    let context = settings.context_window.unwrap_or(state.context_window);
+    vec![
+        ModelSettingRow {
+            label: "Thinking".to_string(),
+            value: thinking.to_string(),
+            action: ModelSettingAction::ToggleThinking,
+        },
+        ModelSettingRow {
+            label: "Reasoning effort".to_string(),
+            value: effort,
+            action: ModelSettingAction::CycleEffort,
+        },
+        ModelSettingRow {
+            label: "Max output tokens".to_string(),
+            value: max_tokens_label(settings.generation.max_tokens),
+            action: ModelSettingAction::CycleMaxTokens,
+        },
+        ModelSettingRow {
+            label: "Temperature".to_string(),
+            value: temperature_label(settings.generation.temperature),
+            action: ModelSettingAction::CycleTemperature,
+        },
+        ModelSettingRow {
+            label: "Context window".to_string(),
+            value: context_label(context),
+            action: ModelSettingAction::CycleContext,
+        },
+    ]
+}
+
+fn save_model_settings(state: &TuiState) {
+    let _ = state.model_settings.save(&state.model_settings_path);
+}
+
+fn select_model(state: &mut TuiState, model: &str, cmd_tx: &mpsc::UnboundedSender<Command>) {
+    let settings = model_settings_for(state, model);
+    let context = settings.context_window.unwrap_or(state.context_window);
+    state.model = model.to_string();
+    state.generation = settings.generation.clone();
+    state.context_window = context;
+    state.model_settings.upsert(
+        model,
+        ModelSettings {
+            generation: settings.generation.clone(),
+            context_window: Some(context),
+        },
+    );
+    state.model_settings.active = Some(model.to_string());
+    save_model_settings(state);
+    let _ = cmd_tx.send(Command::SetModel(model.to_string()));
+    let _ = cmd_tx.send(Command::SetGeneration(settings.generation));
+    let _ = cmd_tx.send(Command::SetContextWindow(context));
+}
+
+fn edit_model_setting(
+    state: &mut TuiState,
+    model: &str,
+    action: ModelSettingAction,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
+) {
+    let mut settings = model_settings_for(state, model);
+    match action {
+        ModelSettingAction::ToggleThinking => {
+            settings.generation.thinking = Some(match settings.generation.thinking {
+                Some(true) => false,
+                Some(false) => true,
+                None => false,
+            });
+        }
+        ModelSettingAction::CycleEffort => {
+            let current = settings
+                .generation
+                .reasoning_effort
+                .clone()
+                .unwrap_or_else(|| "high".to_string());
+            settings.generation.reasoning_effort = Some(cycle_effort(&current));
+        }
+        ModelSettingAction::CycleMaxTokens => {
+            settings.generation.max_tokens = cycle_max_tokens(settings.generation.max_tokens);
+        }
+        ModelSettingAction::CycleTemperature => {
+            settings.generation.temperature = cycle_temperature(settings.generation.temperature);
+        }
+        ModelSettingAction::CycleContext => {
+            let current = settings.context_window.unwrap_or(state.context_window);
+            settings.context_window = Some(cycle_context_window(current));
+        }
+    }
+    state.model_settings.upsert(model, settings.clone());
+    save_model_settings(state);
+    if model == state.model {
+        let context = settings.context_window.unwrap_or(state.context_window);
+        state.generation = settings.generation.clone();
+        state.context_window = context;
+        let _ = cmd_tx.send(Command::SetGeneration(settings.generation));
+        let _ = cmd_tx.send(Command::SetContextWindow(context));
+    }
+}
+
 fn handle_picker_key(state: &mut TuiState, key: KeyEvent, cmd_tx: &mpsc::UnboundedSender<Command>) {
-    let choice = match key.code {
+    let Some(picker) = state.picker.as_ref() else {
+        return;
+    };
+    let kind = picker.kind;
+    let focus = picker.focus;
+    match key.code {
         KeyCode::Esc => {
             state.picker = None;
             return;
         }
-        KeyCode::Up => {
-            if let Some(picker) = state.picker.as_mut() {
-                let len = picker.options.len();
-                if len > 0 {
-                    picker.selected = if picker.selected == 0 {
-                        len - 1
-                    } else {
-                        picker.selected - 1
-                    };
+        KeyCode::Tab | KeyCode::Right
+            if kind == PickerKind::Model && focus == PickerFocus::Models && state.deepseek_mode =>
+        {
+            let has_settings = highlighted_model(state)
+                .map(|model| !model_setting_rows(state, &model).is_empty())
+                .unwrap_or(false);
+            if has_settings {
+                if let Some(picker) = state.picker.as_mut() {
+                    picker.focus = PickerFocus::Settings;
+                    picker.settings_selected = 0;
                 }
             }
             return;
         }
-        KeyCode::Down => {
+        KeyCode::BackTab | KeyCode::Left
+            if kind == PickerKind::Model && focus == PickerFocus::Settings =>
+        {
             if let Some(picker) = state.picker.as_mut() {
-                let len = picker.options.len();
-                if len > 0 {
-                    picker.selected = (picker.selected + 1) % len;
+                picker.focus = PickerFocus::Models;
+                picker.settings_selected = 0;
+            }
+            return;
+        }
+        KeyCode::Up | KeyCode::Down => {
+            let settings_len = if kind == PickerKind::Model && focus == PickerFocus::Settings {
+                highlighted_model(state)
+                    .map(|model| model_setting_rows(state, &model).len())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            if let Some(picker) = state.picker.as_mut() {
+                if kind == PickerKind::Model && focus == PickerFocus::Settings {
+                    if settings_len > 0 {
+                        let down = matches!(key.code, KeyCode::Down);
+                        picker.settings_selected = if down {
+                            (picker.settings_selected + 1) % settings_len
+                        } else if picker.settings_selected == 0 {
+                            settings_len - 1
+                        } else {
+                            picker.settings_selected - 1
+                        };
+                    }
+                } else {
+                    let len = picker.options.len();
+                    if len > 0 {
+                        picker.selected = if matches!(key.code, KeyCode::Down) {
+                            (picker.selected + 1) % len
+                        } else if picker.selected == 0 {
+                            len - 1
+                        } else {
+                            picker.selected - 1
+                        };
+                        picker.settings_selected = 0;
+                    }
                 }
             }
+            return;
+        }
+        KeyCode::Enter | KeyCode::Char(' ')
+            if kind == PickerKind::Model && focus == PickerFocus::Settings =>
+        {
+            let Some(model) = highlighted_model(state) else {
+                return;
+            };
+            let rows = model_setting_rows(state, &model);
+            let Some(row) = state.picker.as_ref().and_then(|picker| {
+                rows.get(picker.settings_selected.min(rows.len().saturating_sub(1)))
+            }) else {
+                return;
+            };
+            let action = row.action;
+            edit_model_setting(state, &model, action, cmd_tx);
             return;
         }
         KeyCode::Enter => {
@@ -1095,26 +1247,25 @@ fn handle_picker_key(state: &mut TuiState, key: KeyEvent, cmd_tx: &mpsc::Unbound
             let Some(option) = picker.options.get(picker.selected) else {
                 return;
             };
-            (picker.kind, option.value.clone())
+            let value = option.value.clone();
+            state.picker = None;
+            match kind {
+                PickerKind::Mode => {
+                    if agent_core::Mode::parse(&value).is_some() {
+                        state.mode = value.clone();
+                        let _ = cmd_tx.send(Command::SetMode(value));
+                    }
+                }
+                PickerKind::Model => select_model(state, &value, cmd_tx),
+            }
+            return;
         }
         _ => return,
-    };
-
-    state.picker = None;
-    match choice.0 {
-        PickerKind::Mode => {
-            if agent_core::Mode::parse(&choice.1).is_some() {
-                state.mode = choice.1.clone();
-                let _ = cmd_tx.send(Command::SetMode(choice.1));
-            }
-        }
-        PickerKind::Model => apply_model_choice(state, &choice.1, cmd_tx),
     }
 }
 
 fn apply_model_choice(state: &mut TuiState, value: &str, cmd_tx: &mpsc::UnboundedSender<Command>) {
-    state.model = value.to_string();
-    let _ = cmd_tx.send(Command::SetModel(value.to_string()));
+    select_model(state, value, cmd_tx);
 }
 
 fn model_label(model: &str) -> String {
@@ -1158,9 +1309,15 @@ fn open_model_picker(state: &mut TuiState) {
     state.picker = Some(PickerState {
         kind: PickerKind::Model,
         title: "Select model".to_string(),
-        subtitle: "Applies to this session · switch at any time".to_string(),
+        subtitle: if state.deepseek_mode {
+            "Select and configure · →/Tab for parameters".to_string()
+        } else {
+            "Applies to this session · switch at any time".to_string()
+        },
         options,
         selected,
+        focus: PickerFocus::Models,
+        settings_selected: 0,
     });
 }
 
@@ -1188,6 +1345,8 @@ fn open_mode_picker(state: &mut TuiState) {
         subtitle: "Controls how edits and commands are approved".to_string(),
         options,
         selected,
+        focus: PickerFocus::Models,
+        settings_selected: 0,
     });
 }
 
@@ -1214,6 +1373,7 @@ fn submit(
     }
     if cmd_tx.send(Command::UserInput(text)).is_ok() {
         state.busy = true;
+        state.spinner_verb = brand::random_verb().to_string();
         state.turn_text = false;
         state.scanning = false;
         state.spinner = 0;
@@ -1482,6 +1642,13 @@ fn handle_event(state: &mut TuiState, event: Event) {
         }
         Event::TurnStarted { .. } => {
             state.turns = state.turns.saturating_add(1);
+            if state
+                .todos
+                .iter()
+                .all(|todo| todo.status != TodoStatus::InProgress)
+            {
+                state.spinner_verb = brand::random_verb().to_string();
+            }
         }
         Event::SessionStarted { .. } | Event::AssistantMessage { .. } => {}
     }
@@ -1627,7 +1794,7 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &TuiState, model: &str,
     );
 
     let mut tab_spans = Vec::new();
-    for (index, label) in settings_tabs(state.deepseek_mode).iter().enumerate() {
+    for (index, label) in SETTINGS_TABS.iter().enumerate() {
         if index > 0 {
             tab_spans.push(Span::raw("  "));
         }
@@ -1847,8 +2014,28 @@ fn render_picker(frame: &mut Frame, area: Rect, state: &TuiState) {
 
     let list_start = top + 7;
     let footer_y = area.y + area.height.saturating_sub(2);
+    let highlighted = if picker.kind == PickerKind::Model && state.deepseek_mode {
+        picker
+            .options
+            .get(picker.selected)
+            .map(|option| option.value.clone())
+    } else {
+        None
+    };
+    let settings_rows = highlighted
+        .as_deref()
+        .map(|model| model_setting_rows(state, model))
+        .unwrap_or_default();
+    let has_settings = !settings_rows.is_empty();
+    let reserved = if has_settings {
+        settings_rows.len() + 2
+    } else {
+        0
+    };
     let available = footer_y.saturating_sub(list_start) as usize;
-    let max_visible = available.clamp(1, 10);
+    let max_visible = available
+        .saturating_sub(reserved)
+        .clamp(1, if has_settings { 8 } else { 10 });
     let offset = if picker.selected >= max_visible {
         picker.selected + 1 - max_visible
     } else {
@@ -1869,8 +2056,9 @@ fn render_picker(frame: &mut Frame, area: Rect, state: &TuiState) {
     }
 
     for (index, option) in picker.options.iter().skip(offset).take(visible).enumerate() {
-        let focused = offset + index == picker.selected;
-        let marker = if focused { "❯ " } else { "  " };
+        let selected = offset + index == picker.selected;
+        let focused = selected && picker.focus == PickerFocus::Models;
+        let marker = if selected { "❯ " } else { "  " };
         let marker_style = if focused {
             Style::default().fg(ACCENT)
         } else {
@@ -1907,14 +2095,93 @@ fn render_picker(frame: &mut Frame, area: Rect, state: &TuiState) {
         );
     }
 
+    if has_settings {
+        let model = highlighted.as_deref().unwrap_or_default();
+        let header_y = list_start + visible as u16 + 1;
+        let settings_focused = picker.focus == PickerFocus::Settings;
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("  Settings · {}", model_label(model)),
+                if settings_focused {
+                    Style::default().fg(FOCUS).add_modifier(Modifier::BOLD)
+                } else {
+                    dim()
+                },
+            ))),
+            Rect {
+                x: area.x,
+                y: header_y,
+                width: area.width,
+                height: 1,
+            },
+        );
+        let selected_setting = picker.settings_selected.min(settings_rows.len() - 1);
+        for (index, row) in settings_rows.iter().enumerate() {
+            let y = header_y + 1 + index as u16;
+            if y >= footer_y {
+                break;
+            }
+            let focused = settings_focused && index == selected_setting;
+            let marker = if focused { "❯ " } else { "  " };
+            let marker_style = if focused {
+                Style::default().fg(ACCENT)
+            } else {
+                dim()
+            };
+            let label_style = if focused {
+                Style::default().fg(FOCUS).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let label_width = 22usize;
+            let label = if UnicodeWidthStr::width(row.label.as_str()) > label_width {
+                truncate(&row.label, label_width - 1)
+            } else {
+                row.label.clone()
+            };
+            let pad = label_width.saturating_sub(UnicodeWidthStr::width(label.as_str()));
+            let line = Line::from(vec![
+                Span::styled(marker, marker_style),
+                Span::styled(label, label_style),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(row.value.clone(), Style::default().fg(OK)),
+            ]);
+            frame.render_widget(
+                Paragraph::new(line),
+                Rect {
+                    x: area.x + 2,
+                    y,
+                    width: area.width.saturating_sub(4),
+                    height: 1,
+                },
+            );
+        }
+    }
+
     let hidden = picker.options.len().saturating_sub(offset + visible);
-    let mut hint = "  ↑/↓ select · Enter confirm · Esc cancel".to_string();
-    if offset > 0 {
-        hint.push_str(&format!(" · ↑ {offset} above"));
-    }
-    if hidden > 0 {
-        hint.push_str(&format!(" · ↓ {hidden} more"));
-    }
+    let hint = if has_settings {
+        if picker.focus == PickerFocus::Settings {
+            "  ↑/↓ setting · Enter change · ← back · Esc cancel".to_string()
+        } else {
+            let mut hint = "  ↑/↓ model · →/Tab settings · Enter select · Esc cancel".to_string();
+            if offset > 0 {
+                hint.push_str(&format!(" · ↑ {offset}"));
+            }
+            if hidden > 0 {
+                hint.push_str(&format!(" · ↓ {hidden}"));
+            }
+            hint
+        }
+    } else {
+        let mut hint = "  ↑/↓ select · Enter confirm · Esc cancel".to_string();
+        if offset > 0 {
+            hint.push_str(&format!(" · ↑ {offset} above"));
+        }
+        if hidden > 0 {
+            hint.push_str(&format!(" · ↓ {hidden} more"));
+        }
+        hint
+    };
     if footer_y < area.y + area.height {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(hint, dim()))),
@@ -1973,7 +2240,11 @@ fn render_welcome(frame: &mut Frame, area: Rect, state: &TuiState, model: &str) 
         _ => OK,
     };
     let status = if state.busy {
-        format!("working {}", brand::dots(state.spinner).trim_end())
+        format!(
+            "{} {}",
+            state.activity_word(32),
+            brand::dots(state.spinner).trim_end()
+        )
     } else {
         match pose {
             Pose::Scanning => "scanning".to_string(),
@@ -2100,7 +2371,7 @@ fn render_input(frame: &mut Frame, area: Rect, state: &TuiState, model: &str) {
     let busy = state.busy;
     let border = if busy { DIM } else { ACCENT };
     let title = if busy {
-        format!(" working · {model} ")
+        format!(" {} · {model} ", state.activity_word(24))
     } else {
         format!(" {} · {model} ", state.mode)
     };
@@ -2395,6 +2666,44 @@ mod tests {
     }
 
     #[test]
+    fn activity_word_prefers_in_progress_todo() {
+        let mut state = TuiState::new("normal".to_string());
+        state.busy = true;
+        state.spinner_verb = "Musing".to_string();
+        assert_eq!(state.activity_word(32), "Musing");
+        state.todos.push(TodoItem {
+            id: "1".to_string(),
+            content: "Running tests".to_string(),
+            status: TodoStatus::InProgress,
+        });
+        assert_eq!(state.activity_word(32), "Running tests");
+        state.todos[0].content = "多行\n任务".to_string();
+        assert_eq!(state.activity_word(32), "多行 任务");
+    }
+
+    #[test]
+    fn renders_spinner_verb_and_active_todo() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut state = TuiState::new("normal".to_string());
+        state.busy = true;
+        state.spinner_verb = "Pouncing".to_string();
+        terminal
+            .draw(|frame| render(frame, &mut state, "mock", "session"))
+            .expect("draw");
+        assert!(buffer_text(&terminal).contains("Pouncing"));
+        state.todos.push(TodoItem {
+            id: "1".to_string(),
+            content: "Running tests".to_string(),
+            status: TodoStatus::InProgress,
+        });
+        terminal
+            .draw(|frame| render(frame, &mut state, "mock", "session"))
+            .expect("draw");
+        assert!(buffer_text(&terminal).contains("Running tests"));
+    }
+
+    #[test]
     fn mascot_pose_follows_state() {
         let mut state = TuiState::new("normal".to_string());
         assert_eq!(state.current_pose(), Pose::Idle);
@@ -2504,6 +2813,10 @@ mod tests {
         let mut state = TuiState::new("normal".to_string());
         state.model = "deepseek-flash".to_string();
         state.models = vec!["deepseek-flash".to_string(), "deepseek-v4-pro".to_string()];
+        state.model_settings_path = std::env::temp_dir().join(format!(
+            "whisker-model-settings-{}-picker.json",
+            std::process::id()
+        ));
         state
     }
 
@@ -2628,13 +2941,13 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_tab_renders_and_updates_generation() {
+    fn model_picker_edits_settings_and_persists() {
         let dir = std::env::temp_dir().join(format!(
-            "whisker-deepseek-settings-{}-tab",
+            "whisker-model-settings-{}-edit",
             std::process::id()
         ));
         let path = dir.join("settings.json");
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::unbounded_channel();
         let mut state = picker_state();
         state.deepseek_mode = true;
         state.context_window = 1_048_576;
@@ -2645,57 +2958,137 @@ mod tests {
             thinking: Some(true),
             reasoning_effort: Some("high".to_string()),
         };
-        state.deepseek_settings_path = path.clone();
-        state.settings = Some(SettingsPage {
-            tab: 1,
-            focus: SettingsFocus::List,
-            query: String::new(),
-            selected: Some(1),
-            command: "/config".to_string(),
-        });
+        state.model_settings_path = path.clone();
+        open_model_picker(&mut state);
 
-        let backend = TestBackend::new(120, 30);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|frame| render(frame, &mut state, "ignored", "session"))
-            .expect("draw");
-        assert!(row_text(&terminal, 4).contains("DeepSeek"));
-        assert!(row_text(&terminal, 11).contains("Model"));
-        assert!(row_text(&terminal, 12).contains("Thinking"));
-        assert!(row_text(&terminal, 12).contains("on"));
-        assert!(row_text(&terminal, 13).contains("Reasoning effort"));
-        assert!(row_text(&terminal, 13).contains("high"));
-        assert!(row_text(&terminal, 14).contains("Max output tokens"));
-        assert!(row_text(&terminal, 14).contains("auto"));
-        assert!(row_text(&terminal, 15).contains("Temperature"));
-        assert!(row_text(&terminal, 15).contains("0.2"));
-        assert!(row_text(&terminal, 16).contains("Context window"));
-        assert!(row_text(&terminal, 16).contains("1M"));
-
-        for selected in [1, 2, 3, 4] {
-            if let Some(page) = state.settings.as_mut() {
-                page.selected = Some(selected);
-            }
-            handle_settings_key(
+        handle_picker_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            &tx,
+        );
+        assert_eq!(
+            state.picker.as_ref().map(|picker| picker.focus),
+            Some(PickerFocus::Settings)
+        );
+        handle_picker_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &tx,
+        );
+        for _ in 0..4 {
+            handle_picker_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                &tx,
+            );
+            handle_picker_key(
                 &mut state,
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
                 &tx,
-                "mock-model",
-                "session-id",
             );
         }
         assert_eq!(state.generation.thinking, Some(false));
         assert_eq!(state.generation.reasoning_effort.as_deref(), Some("max"));
         assert_eq!(state.generation.max_tokens, Some(8_192));
         assert_eq!(state.generation.temperature, Some(0.5));
-        let saved = GenerationSettings::load(&path).expect("saved settings");
-        assert_eq!(saved.thinking, Some(false));
-        assert_eq!(saved.reasoning_effort.as_deref(), Some("max"));
-        assert_eq!(saved.max_tokens, Some(8_192));
-        assert_eq!(saved.temperature, Some(0.5));
-        for _ in 0..4 {
-            assert!(matches!(rx.try_recv(), Ok(Command::SetGeneration(_))));
-        }
+        assert_eq!(state.context_window, 128_000);
+
+        let store = ModelSettingsStore::load(&path).expect("saved settings");
+        let saved = store.get("deepseek-flash").expect("flash settings");
+        assert_eq!(saved.generation.thinking, Some(false));
+        assert_eq!(saved.generation.reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(saved.generation.max_tokens, Some(8_192));
+        assert_eq!(saved.generation.temperature, Some(0.5));
+        assert_eq!(saved.context_window, Some(128_000));
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut state, "ignored", "session"))
+            .expect("draw");
+        assert!(row_text(&terminal, 11).contains("Settings · DeepSeek Flash"));
+        assert!(row_text(&terminal, 12).contains("Thinking"));
+        assert!(row_text(&terminal, 12).contains("off"));
+        assert!(row_text(&terminal, 13).contains("Reasoning effort"));
+        assert!(row_text(&terminal, 13).contains("max"));
+        assert!(row_text(&terminal, 16).contains("Context window"));
+        assert!(row_text(&terminal, 16).contains("128K"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn model_picker_applies_saved_per_model_settings() {
+        let dir = std::env::temp_dir().join(format!(
+            "whisker-model-settings-{}-switch",
+            std::process::id()
+        ));
+        let path = dir.join("settings.json");
+        let mut store = ModelSettingsStore::default();
+        store.upsert(
+            "deepseek-flash",
+            ModelSettings {
+                generation: GenerationSettings {
+                    thinking: Some(true),
+                    reasoning_effort: Some("high".to_string()),
+                    ..GenerationSettings::default()
+                },
+                context_window: Some(1_048_576),
+            },
+        );
+        store.upsert(
+            "deepseek-v4-pro",
+            ModelSettings {
+                generation: GenerationSettings {
+                    thinking: Some(false),
+                    reasoning_effort: Some("max".to_string()),
+                    max_tokens: Some(8_192),
+                    temperature: Some(1.0),
+                    ..GenerationSettings::default()
+                },
+                context_window: Some(128_000),
+            },
+        );
+        store.save(&path).expect("save store");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = picker_state();
+        state.deepseek_mode = true;
+        state.model_settings = store;
+        state.model_settings_path = path.clone();
+        state.generation = GenerationSettings {
+            thinking: Some(true),
+            reasoning_effort: Some("high".to_string()),
+            ..GenerationSettings::default()
+        };
+        state.context_window = 1_048_576;
+        open_model_picker(&mut state);
+
+        handle_picker_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &tx,
+        );
+        handle_picker_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &tx,
+        );
+        assert!(state.picker.is_none());
+        assert_eq!(state.model, "deepseek-v4-pro");
+        assert_eq!(state.generation.thinking, Some(false));
+        assert_eq!(state.generation.reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(state.generation.max_tokens, Some(8_192));
+        assert_eq!(state.context_window, 128_000);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Command::SetModel(model)) if model == "deepseek-v4-pro"
+        ));
+        assert!(matches!(rx.try_recv(), Ok(Command::SetGeneration(_))));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Command::SetContextWindow(128_000))
+        ));
+        let reloaded = ModelSettingsStore::load(&path).expect("reload");
+        assert_eq!(reloaded.active.as_deref(), Some("deepseek-v4-pro"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

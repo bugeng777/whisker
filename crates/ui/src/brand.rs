@@ -398,6 +398,76 @@ pub fn dots(frame: usize) -> &'static str {
     FRAMES[frame % FRAMES.len()]
 }
 
+pub const SPINNER_VERBS: &[&str] = &[
+    "Whiskering",
+    "Pouncing",
+    "Prowling",
+    "Purring",
+    "Chasing",
+    "Stalking",
+    "Sniffing",
+    "Batting",
+    "Pawing",
+    "Mousing",
+    "Hunting",
+    "Scampering",
+    "Skedaddling",
+    "Moseying",
+    "Noodling",
+    "Pondering",
+    "Musing",
+    "Cogitating",
+    "Tinkering",
+    "Brewing",
+    "Scheming",
+    "Plotting",
+    "Rummaging",
+    "Snooping",
+    "Fermenting",
+    "Marinating",
+    "Percolating",
+    "Simmering",
+    "Conjuring",
+    "Spelunking",
+    "Wrangling",
+    "Untangling",
+    "Weaving",
+    "Whittling",
+    "Fiddling",
+    "Frolicking",
+    "Gallivanting",
+    "Hyperspacing",
+    "Ionizing",
+    "Quantumizing",
+    "Reticulating",
+    "Combobulating",
+    "Recombobulating",
+    "Discombobulating",
+    "Flummoxing",
+    "Puzzling",
+    "Unfurling",
+    "Zigzagging",
+    "Vibing",
+    "Zesting",
+    "Crunching",
+    "Churning",
+    "Nesting",
+    "Doodling",
+    "Perambulating",
+];
+
+pub fn pick_verb(seed: usize) -> &'static str {
+    SPINNER_VERBS[seed % SPINNER_VERBS.len()]
+}
+
+pub fn random_verb() -> &'static str {
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos() as usize)
+        .unwrap_or(0);
+    pick_verb(seed)
+}
+
 pub fn spinner(frame: usize) -> String {
     format!("{}  {}", MARK, dots(frame))
 }
@@ -430,6 +500,14 @@ mod tests {
         assert_ne!(idle, signature(Pose::Scanning));
         assert_ne!(idle, signature(Pose::Working));
         assert_ne!(idle, signature(Pose::Success));
+    }
+
+    #[test]
+    fn spinner_verbs_wrap() {
+        assert!(!SPINNER_VERBS.is_empty());
+        assert_eq!(pick_verb(0), SPINNER_VERBS[0]);
+        assert_eq!(pick_verb(SPINNER_VERBS.len()), SPINNER_VERBS[0]);
+        assert_eq!(pick_verb(SPINNER_VERBS.len() + 3), SPINNER_VERBS[3]);
     }
 }
 

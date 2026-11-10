@@ -105,14 +105,12 @@ Provider selection: `--profile`, `[agent] profile`, or the built-in DeepSeek def
 ```
 
 `/model` and `/mode` open an interactive picker: ↑/↓ to move, Enter to confirm, Esc to
-cancel. `/model` switches the provider model for subsequent requests; `provider.models`
-in the config file sets the options (DeepSeek defaults to flash/v4-pro).
-
-For DeepSeek, `/config` → **DeepSeek** exposes thinking on/off, reasoning effort
-(low/high/max), max output tokens, temperature, and context window. Changes apply to the
-next request and persist to `~/.whisker/deepseek-settings.json`, which overrides the
-provider defaults. The same parameters can be set in `config.toml` as `thinking`,
-`reasoning_effort`, `max_tokens`, `top_p`, and `temperature`.
+cancel. `/model` switches the provider model and includes inline settings for the
+highlighted model. Press `→`/`Tab` to edit thinking on/off, reasoning effort
+(low/high/max), max output tokens, temperature, and context window; `←` returns to the
+model list. Settings are saved per model in `~/.whisker/model-settings.json` (override
+with `WHISKER_MODEL_SETTINGS`), together with the last active model. `provider.models`
+in the config file sets the available options (DeepSeek defaults to flash/v4-pro).
 
 ## Skills
 

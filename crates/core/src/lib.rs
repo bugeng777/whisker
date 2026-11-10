@@ -17,5 +17,6 @@ pub use session::{ConversationState, SessionStore};
 pub use subagent::SubagentTool;
 pub use tool::{ProgressSink, Tool, ToolCtx, ToolOutput, ToolRegistry};
 pub use types::{
-    ChatRequest, Event, GenerationSettings, Message, StreamEvent, ToolCall, ToolSpec, Usage,
+    ChatRequest, Event, GenerationSettings, Message, ModelSettings, ModelSettingsStore,
+    StreamEvent, ToolCall, ToolSpec, Usage,
 };

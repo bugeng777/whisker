@@ -28,8 +28,8 @@ reasoning_effort = "high" # low | high | max
 # "drop" strips reasoning_content when thinking is off (default). When thinking is
 # on, Whisker keeps reasoning_content so tool calls can be sent back safely.
 reasoning_content = "drop"
-# /config -> DeepSeek writes ~/.whisker/deepseek-settings.json, which overrides
-# the values above at runtime.
+# /model -> right arrow/Tab edits per-model settings; they are saved in
+# ~/.whisker/model-settings.json and override the values above.
 
 # Any OpenAI-compatible endpoint works. Examples:
 # [providers.kimi]

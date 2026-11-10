@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -125,7 +126,31 @@ pub struct GenerationSettings {
     pub reasoning_effort: Option<String>,
 }
 
-impl GenerationSettings {
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelSettings {
+    pub generation: GenerationSettings,
+    pub context_window: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelSettingsStore {
+    pub active: Option<String>,
+    pub models: BTreeMap<String, ModelSettings>,
+}
+
+impl ModelSettingsStore {
+    pub fn default_path() -> PathBuf {
+        std::env::var_os("WHISKER_MODEL_SETTINGS")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(".whisker/model-settings.json"))
+            })
+            .unwrap_or_else(|| PathBuf::from(".whisker/model-settings.json"))
+    }
+
     pub fn load(path: &Path) -> Option<Self> {
         let raw = std::fs::read_to_string(path).ok()?;
         serde_json::from_str(&raw).ok()
@@ -136,6 +161,14 @@ impl GenerationSettings {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(path, serde_json::to_string_pretty(self)?)
+    }
+
+    pub fn get(&self, model: &str) -> Option<&ModelSettings> {
+        self.models.get(model)
+    }
+
+    pub fn upsert(&mut self, model: &str, settings: ModelSettings) {
+        self.models.insert(model.to_string(), settings);
     }
 }
 

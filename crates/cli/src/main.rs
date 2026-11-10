@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use agent_core::{
     Agent, AgentConfig, ApprovalDecision, ApprovalRequest, CancelHandle, Event, GenerationSettings,
-    Interactor, LlmClient, Mode, Policy, SessionStore, Tool, ToolRegistry,
+    Interactor, LlmClient, Mode, ModelSettingsStore, Policy, SessionStore, Tool, ToolRegistry,
 };
 use agent_llm::{OpenAiProvider, ReasoningPolicy};
 use agent_tools::native_tools;
@@ -134,15 +134,29 @@ async fn main() -> Result<()> {
                 .expect("built-in provider")
         });
 
-    let model = args.model.clone().unwrap_or_else(|| provider.model.clone());
+    let configured_model = args.model.clone().unwrap_or_else(|| provider.model.clone());
     let mut models = provider
         .models
         .clone()
         .filter(|models| !models.is_empty())
         .unwrap_or_else(|| config::default_models(&profile_name));
     if models.is_empty() {
-        models.push(model.clone());
-    } else if !models.iter().any(|choice| choice == &model) {
+        models.push(configured_model.clone());
+    } else if !models.iter().any(|choice| choice == &configured_model) {
+        models.insert(0, configured_model.clone());
+    }
+    let model_store =
+        ModelSettingsStore::load(&ModelSettingsStore::default_path()).unwrap_or_default();
+    let model = if args.model.is_none() {
+        model_store
+            .active
+            .clone()
+            .filter(|active| models.iter().any(|model| model == active))
+            .unwrap_or_else(|| configured_model.clone())
+    } else {
+        configured_model.clone()
+    };
+    if !models.iter().any(|choice| choice == &model) {
         models.insert(0, model.clone());
     }
     let vision = provider
@@ -152,14 +166,12 @@ async fn main() -> Result<()> {
         .base_url
         .clone()
         .unwrap_or_else(|| provider.base_url.clone());
-    let context_window = provider.context_window.unwrap_or(65536);
     let api_key = resolve_api_key(&provider, &config_path)?;
 
     let deepseek_mode = profile_name.eq_ignore_ascii_case("deepseek")
         || base_url.contains("api.deepseek.com")
         || model.to_ascii_lowercase().contains("deepseek");
-    let deepseek_settings_path = deepseek_settings_path(&home);
-    let mut generation = GenerationSettings {
+    let mut fallback_generation = GenerationSettings {
         temperature: provider.temperature.or(config.agent.temperature),
         max_tokens: provider.max_tokens,
         top_p: provider.top_p,
@@ -167,22 +179,29 @@ async fn main() -> Result<()> {
         reasoning_effort: provider.reasoning_effort.clone(),
     };
     if deepseek_mode {
+        if fallback_generation.thinking.is_none() {
+            fallback_generation.thinking = Some(true);
+        }
+        if fallback_generation.reasoning_effort.is_none() {
+            fallback_generation.reasoning_effort = Some("high".to_string());
+        }
+    }
+    let saved = model_store.get(&model);
+    let mut generation = saved
+        .map(|settings| settings.generation.clone())
+        .unwrap_or(fallback_generation);
+    if deepseek_mode {
         if generation.thinking.is_none() {
             generation.thinking = Some(true);
         }
         if generation.reasoning_effort.is_none() {
             generation.reasoning_effort = Some("high".to_string());
         }
-        if let Some(saved) = GenerationSettings::load(&deepseek_settings_path) {
-            generation = saved;
-            if generation.thinking.is_none() {
-                generation.thinking = Some(true);
-            }
-            if generation.reasoning_effort.is_none() {
-                generation.reasoning_effort = Some("high".to_string());
-            }
-        }
     }
+    let context_window = saved
+        .and_then(|settings| settings.context_window)
+        .or(provider.context_window)
+        .unwrap_or(65536);
 
     let reasoning_policy = match provider.reasoning_content.as_deref() {
         Some("echo") => ReasoningPolicy::Echo,
@@ -398,12 +417,6 @@ fn resolve_api_key(provider: &ProviderConfig, config_path: &Path) -> Result<Stri
         "no API key found. Set {env_name} or add api_key to the provider in {}",
         config_path.display()
     ))
-}
-
-fn deepseek_settings_path(home: &Path) -> PathBuf {
-    std::env::var_os("WHISKER_DEEPSEEK_SETTINGS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".whisker").join("deepseek-settings.json"))
 }
 
 fn build_system_prompt(cwd: &Path) -> String {
