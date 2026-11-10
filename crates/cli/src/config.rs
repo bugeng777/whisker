@@ -60,6 +60,16 @@ pub struct ProviderConfig {
     pub context_window: Option<usize>,
     #[serde(default)]
     pub reasoning_content: Option<String>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub thinking: Option<bool>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 fn default_base_url() -> String {
@@ -76,7 +86,7 @@ pub fn default_vision(model: &str) -> bool {
 
 pub fn default_models(profile: &str) -> Vec<String> {
     if profile.eq_ignore_ascii_case("deepseek") {
-        ["deepseek-flash", "deepseek-chat", "deepseek-v4-pro"]
+        ["deepseek-flash", "deepseek-v4-pro"]
             .iter()
             .map(|model| model.to_string())
             .collect()
@@ -107,6 +117,11 @@ impl Default for Config {
                 vision: None,
                 context_window: Some(1_048_576),
                 reasoning_content: None,
+                temperature: None,
+                max_tokens: None,
+                top_p: None,
+                thinking: None,
+                reasoning_effort: None,
             },
         );
         Self {
@@ -134,12 +149,43 @@ pub fn load(path: &Path) -> Result<Config> {
 
 #[cfg(test)]
 mod tests {
-    use super::default_vision;
+    use super::{default_models, default_vision, Config};
 
     #[test]
     fn vision_defaults_follow_model_family() {
         assert!(default_vision("deepseek-flash"));
         assert!(default_vision("deepseek-chat"));
         assert!(!default_vision("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn deepseek_default_models_offer_flash_and_pro() {
+        let models = default_models("deepseek");
+        assert_eq!(
+            models,
+            vec!["deepseek-flash".to_string(), "deepseek-v4-pro".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_deepseek_generation_settings() {
+        let config: Config = toml::from_str(
+            r#"
+            [providers.deepseek]
+            model = "deepseek-v4-pro"
+            thinking = true
+            reasoning_effort = "max"
+            max_tokens = 65536
+            top_p = 0.95
+            temperature = 0.2
+            "#,
+        )
+        .expect("config");
+        let provider = config.providers.get("deepseek").expect("provider");
+        assert_eq!(provider.thinking, Some(true));
+        assert_eq!(provider.reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(provider.max_tokens, Some(65_536));
+        assert_eq!(provider.top_p, Some(0.95));
+        assert_eq!(provider.temperature, Some(0.2));
     }
 }

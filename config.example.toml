@@ -13,13 +13,23 @@ base_url = "https://api.deepseek.com/v1"
 api_key_env = "DEEPSEEK_API_KEY"
 model = "deepseek-flash"
 # Options shown by the in-session /model picker (omitted = DeepSeek defaults).
-models = ["deepseek-flash", "deepseek-chat", "deepseek-v4-pro"]
-# true = the model accepts image parts (deepseek-flash/deepseek-chat).
+models = ["deepseek-flash", "deepseek-v4-pro"]
+# Whether the model accepts image parts (deepseek-flash supports images;
+# deepseek-v4-pro is text-only).
 vision = true
 context_window = 1048576
-# "drop" strips reasoning_content from later requests (default).
-# Use "echo" for providers that require it to be sent back.
+# DeepSeek V4 thinking mode. The API defaults to thinking on with effort "high".
+thinking = true
+reasoning_effort = "high" # low | high | max
+# Optional generation limits (the API defaults to 8K non-thinking / 64K thinking).
+# max_tokens = 65536
+# top_p = 0.95
+# temperature = 0.2 # overrides [agent] temperature for this provider
+# "drop" strips reasoning_content when thinking is off (default). When thinking is
+# on, Whisker keeps reasoning_content so tool calls can be sent back safely.
 reasoning_content = "drop"
+# /config -> DeepSeek writes ~/.whisker/deepseek-settings.json, which overrides
+# the values above at runtime.
 
 # Any OpenAI-compatible endpoint works. Examples:
 # [providers.kimi]

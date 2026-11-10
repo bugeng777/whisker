@@ -16,4 +16,6 @@ pub use policy::{ApprovalDecision, ApprovalRequest, Decision, Interactor, Policy
 pub use session::{ConversationState, SessionStore};
 pub use subagent::SubagentTool;
 pub use tool::{ProgressSink, Tool, ToolCtx, ToolOutput, ToolRegistry};
-pub use types::{ChatRequest, Event, Message, StreamEvent, ToolCall, ToolSpec, Usage};
+pub use types::{
+    ChatRequest, Event, GenerationSettings, Message, StreamEvent, ToolCall, ToolSpec, Usage,
+};

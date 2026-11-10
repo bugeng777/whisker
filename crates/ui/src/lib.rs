@@ -8,8 +8,8 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use agent_core::{
-    Agent, ApprovalDecision, ApprovalRequest, CancelHandle, Event, Interactor, Mode, TodoItem,
-    TodoStatus,
+    Agent, ApprovalDecision, ApprovalRequest, CancelHandle, Event, GenerationSettings, Interactor,
+    Mode, TodoItem, TodoStatus,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -22,6 +22,7 @@ pub enum Command {
     CycleMode,
     SetMode(String),
     SetModel(String),
+    SetGeneration(GenerationSettings),
     SetContextWindow(usize),
     Compact,
     Clear,
@@ -110,6 +111,10 @@ pub async fn run_agent(mut agent: Agent, mut commands: mpsc::UnboundedReceiver<C
             }
             Command::SetModel(value) => {
                 agent.set_model(value);
+                let _ = agent.session.save();
+            }
+            Command::SetGeneration(generation) => {
+                agent.set_generation(generation);
                 let _ = agent.session.save();
             }
             Command::SetContextWindow(window) => {

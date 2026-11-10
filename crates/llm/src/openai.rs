@@ -202,6 +202,58 @@ struct CallBuilder {
     arguments: String,
 }
 
+fn request_body(
+    model: &str,
+    request: &ChatRequest,
+    reasoning_policy: ReasoningPolicy,
+) -> serde_json::Value {
+    let generation = &request.generation;
+    let thinking_on = generation.thinking == Some(true)
+        || (generation.thinking.is_none()
+            && generation
+                .reasoning_effort
+                .as_deref()
+                .is_some_and(|effort| !effort.eq_ignore_ascii_case("none")));
+    let mut messages = messages_to_json(&request.messages);
+    if reasoning_policy == ReasoningPolicy::Drop && !thinking_on {
+        strip_reasoning_content(&mut messages);
+    }
+    let mut body = json!({
+        "model": model,
+        "messages": messages,
+        "stream": true,
+        "stream_options": { "include_usage": true },
+    });
+
+    if !request.tools.is_empty() {
+        let tools: Vec<serde_json::Value> = request
+            .tools
+            .iter()
+            .map(|spec| json!({ "type": "function", "function": spec }))
+            .collect();
+        body["tools"] = serde_json::Value::Array(tools);
+        body["tool_choice"] = json!("auto");
+    }
+    if let Some(temperature) = generation.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if let Some(max_tokens) = generation.max_tokens {
+        body["max_tokens"] = json!(max_tokens);
+    }
+    if let Some(top_p) = generation.top_p {
+        body["top_p"] = json!(top_p);
+    }
+    if let Some(thinking) = generation.thinking {
+        body["thinking"] = json!({
+            "type": if thinking { "enabled" } else { "disabled" }
+        });
+    }
+    if let Some(effort) = &generation.reasoning_effort {
+        body["reasoning_effort"] = json!(effort);
+    }
+    body
+}
+
 #[async_trait]
 impl LlmClient for OpenAiProvider {
     fn model(&self) -> String {
@@ -224,33 +276,7 @@ impl LlmClient for OpenAiProvider {
         cancel: CancellationToken,
     ) -> Result<Usage> {
         let url = format!("{}/chat/completions", self.base_url);
-        let model = self.model();
-        let mut messages = messages_to_json(&request.messages);
-        if self.reasoning_policy == ReasoningPolicy::Drop {
-            strip_reasoning_content(&mut messages);
-        }
-        let mut body = json!({
-            "model": model,
-            "messages": messages,
-            "stream": true,
-            "stream_options": { "include_usage": true },
-        });
-
-        if !request.tools.is_empty() {
-            let tools: Vec<serde_json::Value> = request
-                .tools
-                .iter()
-                .map(|spec| json!({ "type": "function", "function": spec }))
-                .collect();
-            body["tools"] = serde_json::Value::Array(tools);
-            body["tool_choice"] = json!("auto");
-        }
-        if let Some(temperature) = request.temperature {
-            body["temperature"] = json!(temperature);
-        }
-        if let Some(max_tokens) = request.max_tokens {
-            body["max_tokens"] = json!(max_tokens);
-        }
+        let body = request_body(&self.model(), &request, self.reasoning_policy);
 
         let mut attempt = 0u32;
         loop {
@@ -399,6 +425,50 @@ fn truncate(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_core::GenerationSettings;
+
+    fn deepseek_request(thinking: bool) -> ChatRequest {
+        ChatRequest {
+            messages: vec![
+                Message::user("hi"),
+                Message::Assistant {
+                    content: Some("answer".to_string()),
+                    tool_calls: None,
+                    reasoning_content: Some("reasoning".to_string()),
+                },
+            ],
+            tools: Vec::new(),
+            generation: GenerationSettings {
+                temperature: Some(0.2),
+                max_tokens: Some(8_192),
+                top_p: Some(0.95),
+                thinking: Some(thinking),
+                reasoning_effort: Some("high".to_string()),
+            },
+        }
+    }
+
+    #[test]
+    fn serializes_deepseek_generation_settings() {
+        let request = deepseek_request(true);
+        let body = request_body("deepseek-v4-pro", &request, ReasoningPolicy::Drop);
+        let temperature = body["temperature"].as_f64().expect("temperature");
+        assert!((temperature - 0.2).abs() < 0.001);
+        assert_eq!(body["max_tokens"], 8_192);
+        let top_p = body["top_p"].as_f64().expect("top_p");
+        assert!((top_p - 0.95).abs() < 0.001);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["messages"][1]["reasoning_content"], "reasoning");
+    }
+
+    #[test]
+    fn strips_reasoning_when_thinking_is_disabled() {
+        let request = deepseek_request(false);
+        let body = request_body("deepseek-v4-pro", &request, ReasoningPolicy::Drop);
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body["messages"][1].get("reasoning_content").is_none());
+    }
 
     #[test]
     fn user_images_become_content_parts() {

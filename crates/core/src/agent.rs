@@ -16,7 +16,9 @@ use crate::llm::LlmClient;
 use crate::policy::{rule_key, ApprovalDecision, ApprovalRequest, Decision, Interactor, Policy};
 use crate::session::SessionStore;
 use crate::tool::{ProgressSink, ReadLedger, Tool, ToolCtx, ToolOutput, ToolRegistry};
-use crate::types::{ChatRequest, Event, FinishReason, Message, StreamEvent, ToolCall, Usage};
+use crate::types::{
+    ChatRequest, Event, FinishReason, GenerationSettings, Message, StreamEvent, ToolCall, Usage,
+};
 
 pub const MAX_TOOL_RESULT_CHARS: usize = 32 * 1024;
 const PREVIEW_CHARS: usize = 16 * 1024;
@@ -31,7 +33,7 @@ pub struct AgentConfig {
     /// Optional safety cap. `None` waits for the model's finish signal.
     pub max_turns: Option<u32>,
     pub system_prompt: String,
-    pub temperature: Option<f32>,
+    pub generation: GenerationSettings,
     pub skills: Vec<(String, String)>,
     pub pre_tool_use: Vec<String>,
     pub post_tool_use: Vec<String>,
@@ -91,6 +93,29 @@ impl Agent {
         self.session.state.model = model.clone();
         self.emit(Event::Notice {
             message: format!("model → {model}"),
+        });
+    }
+
+    pub fn set_generation(&mut self, generation: GenerationSettings) {
+        self.config.generation = generation.clone();
+        let thinking = match generation.thinking {
+            Some(true) => "on",
+            Some(false) => "off",
+            None => "auto",
+        };
+        self.emit(Event::Notice {
+            message: format!(
+                "params → thinking {thinking} · effort {} · max {} · temp {}",
+                generation.reasoning_effort.as_deref().unwrap_or("auto"),
+                generation
+                    .max_tokens
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "auto".to_string()),
+                generation
+                    .temperature
+                    .map(|value| format!("{value:.1}"))
+                    .unwrap_or_else(|| "auto".to_string())
+            ),
         });
     }
 
@@ -156,8 +181,7 @@ impl Agent {
             let request = ChatRequest {
                 messages: self.build_messages(),
                 tools: self.tools.specs(),
-                temperature: self.config.temperature,
-                max_tokens: None,
+                generation: self.config.generation.clone(),
             };
 
             let streamed = match self.stream_completion(request, &token).await {
@@ -792,8 +816,12 @@ impl Agent {
                 Message::user(format!("Summarize this conversation segment:\n\n{transcript}")),
             ],
             tools: Vec::new(),
-            temperature: Some(0.2),
-            max_tokens: Some(1200),
+            generation: GenerationSettings {
+                temperature: Some(0.2),
+                max_tokens: Some(1200),
+                thinking: Some(false),
+                ..GenerationSettings::default()
+            },
         };
         let summary = self.collect_text(request, token).await?;
         let plan_section = self

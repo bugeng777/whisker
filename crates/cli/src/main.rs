@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_core::{
-    Agent, AgentConfig, ApprovalDecision, ApprovalRequest, CancelHandle, Event, Interactor,
-    LlmClient, Mode, Policy, SessionStore, Tool, ToolRegistry,
+    Agent, AgentConfig, ApprovalDecision, ApprovalRequest, CancelHandle, Event, GenerationSettings,
+    Interactor, LlmClient, Mode, Policy, SessionStore, Tool, ToolRegistry,
 };
 use agent_llm::{OpenAiProvider, ReasoningPolicy};
 use agent_tools::native_tools;
@@ -155,6 +155,35 @@ async fn main() -> Result<()> {
     let context_window = provider.context_window.unwrap_or(65536);
     let api_key = resolve_api_key(&provider, &config_path)?;
 
+    let deepseek_mode = profile_name.eq_ignore_ascii_case("deepseek")
+        || base_url.contains("api.deepseek.com")
+        || model.to_ascii_lowercase().contains("deepseek");
+    let deepseek_settings_path = deepseek_settings_path(&home);
+    let mut generation = GenerationSettings {
+        temperature: provider.temperature.or(config.agent.temperature),
+        max_tokens: provider.max_tokens,
+        top_p: provider.top_p,
+        thinking: provider.thinking,
+        reasoning_effort: provider.reasoning_effort.clone(),
+    };
+    if deepseek_mode {
+        if generation.thinking.is_none() {
+            generation.thinking = Some(true);
+        }
+        if generation.reasoning_effort.is_none() {
+            generation.reasoning_effort = Some("high".to_string());
+        }
+        if let Some(saved) = GenerationSettings::load(&deepseek_settings_path) {
+            generation = saved;
+            if generation.thinking.is_none() {
+                generation.thinking = Some(true);
+            }
+            if generation.reasoning_effort.is_none() {
+                generation.reasoning_effort = Some("high".to_string());
+            }
+        }
+    }
+
     let reasoning_policy = match provider.reasoning_content.as_deref() {
         Some("echo") => ReasoningPolicy::Echo,
         _ => ReasoningPolicy::Drop,
@@ -205,6 +234,7 @@ async fn main() -> Result<()> {
         tools: Arc::new(ToolRegistry::new(sub_tools)),
         max_turns: 8,
         system_prompt: include_str!("../../../prompts/subagent.md").to_string(),
+        generation: generation.clone(),
     }));
 
     let registry = Arc::new(ToolRegistry::new(tools));
@@ -269,7 +299,7 @@ async fn main() -> Result<()> {
             context_window,
             max_turns,
             system_prompt,
-            temperature: config.agent.temperature,
+            generation: generation.clone(),
             skills: skill_catalog.summaries(),
             pre_tool_use: config.hooks.pre_tool_use.clone(),
             post_tool_use: config.hooks.post_tool_use.clone(),
@@ -295,6 +325,9 @@ async fn main() -> Result<()> {
             queue,
             model,
             models,
+            generation,
+            context_window,
+            deepseek_mode,
             session_id,
             mode,
             tui,
@@ -365,6 +398,12 @@ fn resolve_api_key(provider: &ProviderConfig, config_path: &Path) -> Result<Stri
         "no API key found. Set {env_name} or add api_key to the provider in {}",
         config_path.display()
     ))
+}
+
+fn deepseek_settings_path(home: &Path) -> PathBuf {
+    std::env::var_os("WHISKER_DEEPSEEK_SETTINGS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".whisker").join("deepseek-settings.json"))
 }
 
 fn build_system_prompt(cwd: &Path) -> String {
@@ -544,6 +583,9 @@ async fn run_interactive(
     queue: Arc<Mutex<VecDeque<String>>>,
     model: String,
     models: Vec<String>,
+    generation: GenerationSettings,
+    context_window: usize,
+    deepseek_mode: bool,
     session_id: String,
     mode: Mode,
     tui: bool,
@@ -559,6 +601,9 @@ async fn run_interactive(
             queue,
             model,
             models,
+            generation,
+            context_window,
+            deepseek_mode,
             session_id,
             mode.as_str(),
         )

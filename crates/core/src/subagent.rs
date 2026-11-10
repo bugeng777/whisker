@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::llm::LlmClient;
 use crate::policy::{ApprovalDecision, ApprovalRequest, Interactor};
 use crate::tool::{ProgressSink, Tool, ToolCtx, ToolOutput, ToolRegistry};
-use crate::types::{ChatRequest, Message, StreamEvent, ToolCall, Usage};
+use crate::types::{ChatRequest, GenerationSettings, Message, StreamEvent, ToolCall, Usage};
 
 const SUBAGENT_TOOL_TIMEOUT: Duration = Duration::from_secs(300);
 const SUBAGENT_RESULT_LIMIT: usize = 8_000;
@@ -34,6 +34,7 @@ pub struct SubagentTool {
     pub tools: Arc<ToolRegistry>,
     pub max_turns: u32,
     pub system_prompt: String,
+    pub generation: GenerationSettings,
 }
 
 impl SubagentTool {
@@ -200,8 +201,11 @@ impl Tool for SubagentTool {
             let request = ChatRequest {
                 messages: messages.clone(),
                 tools: self.tools.specs(),
-                temperature: Some(0.1),
-                max_tokens: None,
+                generation: GenerationSettings {
+                    temperature: Some(0.1),
+                    max_tokens: None,
+                    ..self.generation.clone()
+                },
             };
             let (content, calls, turn_usage) =
                 match self.stream_completion(request, &ctx.cancel).await {

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -115,12 +115,35 @@ pub struct Usage {
     pub total_tokens: u32,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GenerationSettings {
+    pub temperature: Option<f32>,
+    pub max_tokens: Option<u32>,
+    pub top_p: Option<f32>,
+    pub thinking: Option<bool>,
+    pub reasoning_effort: Option<String>,
+}
+
+impl GenerationSettings {
+    pub fn load(path: &Path) -> Option<Self> {
+        let raw = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(&raw).ok()
+    }
+
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, serde_json::to_string_pretty(self)?)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
-    pub temperature: Option<f32>,
-    pub max_tokens: Option<u32>,
+    pub generation: GenerationSettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

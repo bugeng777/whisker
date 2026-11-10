@@ -1,8 +1,12 @@
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use agent_core::{ApprovalDecision, ApprovalRequest, CancelHandle, Event, TodoItem, TodoStatus};
+use agent_core::{
+    ApprovalDecision, ApprovalRequest, CancelHandle, Event, GenerationSettings, TodoItem,
+    TodoStatus,
+};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
@@ -31,6 +35,78 @@ const RED: Color = Color::Rgb(255, 100, 100);
 const YELLOW: Color = Color::Rgb(230, 190, 80);
 const SETTINGS_COL_WIDTH: usize = 47;
 const SETTINGS_TABS: &[&str] = &["Settings", "Status", "Usage"];
+const DEEPSEEK_SETTINGS_TABS: &[&str] = &["Settings", "DeepSeek", "Status", "Usage"];
+const DEEPSEEK_EFFORTS: &[&str] = &["low", "high", "max"];
+const MAX_TOKEN_PRESETS: &[Option<u32>] =
+    &[None, Some(8_192), Some(32_768), Some(65_536), Some(131_072)];
+const TEMPERATURE_PRESETS: &[f32] = &[0.0, 0.2, 0.5, 1.0, 1.5, 2.0];
+
+fn settings_tabs(deepseek: bool) -> &'static [&'static str] {
+    if deepseek {
+        DEEPSEEK_SETTINGS_TABS
+    } else {
+        SETTINGS_TABS
+    }
+}
+
+fn deepseek_settings_path() -> PathBuf {
+    std::env::var_os("WHISKER_DEEPSEEK_SETTINGS")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join(".whisker/deepseek-settings.json"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".whisker/deepseek-settings.json"))
+}
+
+fn max_tokens_label(value: Option<u32>) -> String {
+    match value {
+        None => "auto".to_string(),
+        Some(value) if value >= 1024 => format!("{}K", value / 1024),
+        Some(value) => value.to_string(),
+    }
+}
+
+fn cycle_max_tokens(value: Option<u32>) -> Option<u32> {
+    let index = MAX_TOKEN_PRESETS
+        .iter()
+        .position(|candidate| *candidate == value)
+        .unwrap_or(0);
+    MAX_TOKEN_PRESETS[(index + 1) % MAX_TOKEN_PRESETS.len()]
+}
+
+fn temperature_label(value: Option<f32>) -> String {
+    value
+        .map(|value| format!("{value:.1}"))
+        .unwrap_or_else(|| "auto".to_string())
+}
+
+fn cycle_temperature(value: Option<f32>) -> Option<f32> {
+    let index = value
+        .and_then(|value| {
+            TEMPERATURE_PRESETS
+                .iter()
+                .position(|candidate| (*candidate - value).abs() < 0.001)
+        })
+        .unwrap_or(0);
+    Some(TEMPERATURE_PRESETS[(index + 1) % TEMPERATURE_PRESETS.len()])
+}
+
+fn cycle_effort(value: &str) -> String {
+    let index = DEEPSEEK_EFFORTS
+        .iter()
+        .position(|candidate| candidate.eq_ignore_ascii_case(value))
+        .unwrap_or(1);
+    DEEPSEEK_EFFORTS[(index + 1) % DEEPSEEK_EFFORTS.len()].to_string()
+}
+
+fn context_label(context: usize) -> String {
+    if context >= 1_048_576 {
+        format!("{}M", context / 1_048_576)
+    } else {
+        format!("{}K", context / 1000)
+    }
+}
 
 struct Chunk {
     text: String,
@@ -69,6 +145,11 @@ enum SettingAction {
     CycleMode,
     ToggleTips,
     ToggleMotion,
+    OpenModelPicker,
+    ToggleThinking,
+    CycleEffort,
+    CycleMaxTokens,
+    CycleTemperature,
 }
 
 struct SettingRow {
@@ -107,6 +188,10 @@ struct TuiState {
     mode: String,
     model: String,
     models: Vec<String>,
+    generation: GenerationSettings,
+    context_window: usize,
+    deepseek_mode: bool,
+    deepseek_settings_path: PathBuf,
     picker: Option<PickerState>,
     todos: Vec<TodoItem>,
     total_in: u32,
@@ -141,6 +226,10 @@ impl TuiState {
             mode,
             model: String::new(),
             models: Vec::new(),
+            generation: GenerationSettings::default(),
+            context_window: 0,
+            deepseek_mode: false,
+            deepseek_settings_path: deepseek_settings_path(),
             picker: None,
             todos: Vec::new(),
             total_in: 0,
@@ -423,6 +512,19 @@ fn setting_rows(state: &TuiState, tab: usize, model: &str, session: &str) -> Vec
     } else {
         state.model.clone()
     };
+    let deepseek_tab = state.deepseek_mode;
+    let status_tab = if deepseek_tab { 2 } else { 1 };
+    let usage_tab = if deepseek_tab { 3 } else { 2 };
+    let thinking = match state.generation.thinking {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "auto",
+    };
+    let effort = state
+        .generation
+        .reasoning_effort
+        .clone()
+        .unwrap_or_else(|| "auto".to_string());
     match tab {
         0 => vec![
             row(
@@ -430,7 +532,11 @@ fn setting_rows(state: &TuiState, tab: usize, model: &str, session: &str) -> Vec
                 state.mode.clone(),
                 Some(SettingAction::CycleMode),
             ),
-            row("Model", effective_model, None),
+            row(
+                "Model",
+                effective_model,
+                Some(SettingAction::OpenModelPicker),
+            ),
             row(
                 "Show tips",
                 bool_value(state.show_tips),
@@ -443,7 +549,35 @@ fn setting_rows(state: &TuiState, tab: usize, model: &str, session: &str) -> Vec
             ),
             row("Session", session.to_string(), None),
         ],
-        1 => {
+        1 if deepseek_tab => vec![
+            row(
+                "Model",
+                effective_model,
+                Some(SettingAction::OpenModelPicker),
+            ),
+            row(
+                "Thinking",
+                thinking.to_string(),
+                Some(SettingAction::ToggleThinking),
+            ),
+            row(
+                "Reasoning effort",
+                effort.clone(),
+                Some(SettingAction::CycleEffort),
+            ),
+            row(
+                "Max output tokens",
+                max_tokens_label(state.generation.max_tokens),
+                Some(SettingAction::CycleMaxTokens),
+            ),
+            row(
+                "Temperature",
+                temperature_label(state.generation.temperature),
+                Some(SettingAction::CycleTemperature),
+            ),
+            row("Context window", context_label(state.context_window), None),
+        ],
+        t if t == status_tab => {
             let status = if state.busy {
                 if state.scanning {
                     "scanning"
@@ -460,6 +594,8 @@ fn setting_rows(state: &TuiState, tab: usize, model: &str, session: &str) -> Vec
                 row("Model", effective_model, None),
                 row("Mode", state.mode.clone(), None),
                 row("State", status.to_string(), None),
+                row("Thinking", thinking.to_string(), None),
+                row("Reasoning effort", effort, None),
                 row(
                     "Tokens",
                     format!("{} / {}", state.total_in, state.total_out),
@@ -468,7 +604,7 @@ fn setting_rows(state: &TuiState, tab: usize, model: &str, session: &str) -> Vec
                 row("Turns", state.turns.to_string(), None),
             ]
         }
-        _ if tab == 2 => vec![
+        t if t == usage_tab => vec![
             row("Input tokens", state.total_in.to_string(), None),
             row("Output tokens", state.total_out.to_string(), None),
             row(
@@ -528,7 +664,51 @@ fn apply_setting(
         }
         SettingAction::ToggleTips => state.show_tips = !state.show_tips,
         SettingAction::ToggleMotion => state.reduce_motion = !state.reduce_motion,
+        SettingAction::OpenModelPicker => {
+            state.settings = None;
+            open_model_picker(state);
+        }
+        SettingAction::ToggleThinking => {
+            update_generation(state, cmd_tx, |generation| {
+                generation.thinking = Some(match generation.thinking {
+                    Some(true) => false,
+                    Some(false) => true,
+                    None => false,
+                });
+            });
+        }
+        SettingAction::CycleEffort => {
+            update_generation(state, cmd_tx, |generation| {
+                let current = generation
+                    .reasoning_effort
+                    .clone()
+                    .unwrap_or_else(|| "high".to_string());
+                generation.reasoning_effort = Some(cycle_effort(&current));
+            });
+        }
+        SettingAction::CycleMaxTokens => {
+            update_generation(state, cmd_tx, |generation| {
+                generation.max_tokens = cycle_max_tokens(generation.max_tokens);
+            });
+        }
+        SettingAction::CycleTemperature => {
+            update_generation(state, cmd_tx, |generation| {
+                generation.temperature = cycle_temperature(generation.temperature);
+            });
+        }
     }
+}
+
+fn update_generation(
+    state: &mut TuiState,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
+    update: impl FnOnce(&mut GenerationSettings),
+) {
+    let mut generation = state.generation.clone();
+    update(&mut generation);
+    state.generation = generation.clone();
+    let _ = generation.save(&state.deepseek_settings_path);
+    let _ = cmd_tx.send(Command::SetGeneration(generation));
 }
 
 fn handle_settings_key(
@@ -541,7 +721,7 @@ fn handle_settings_key(
     let Some(mut page) = state.settings.take() else {
         return;
     };
-    let tab_count = SETTINGS_TABS.len();
+    let tab_count = settings_tabs(state.deepseek_mode).len();
     let rows = filtered_setting_rows(&page, state, model, session);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -652,7 +832,7 @@ fn handle_settings_key(
         }
         _ => {}
     }
-    if keep {
+    if keep && state.picker.is_none() {
         state.settings = Some(page);
     }
 }
@@ -704,6 +884,9 @@ pub async fn run_tui(
     queue: Arc<Mutex<VecDeque<String>>>,
     model: String,
     models: Vec<String>,
+    generation: GenerationSettings,
+    context_window: usize,
+    deepseek_mode: bool,
     session_id: String,
     initial_mode: &str,
 ) -> Result<()> {
@@ -718,6 +901,9 @@ pub async fn run_tui(
     let mut state = TuiState::new(initial_mode.to_string());
     state.model = model.clone();
     state.models = models;
+    state.generation = generation;
+    state.context_window = context_window;
+    state.deepseek_mode = deepseek_mode;
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -1441,7 +1627,7 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &TuiState, model: &str,
     );
 
     let mut tab_spans = Vec::new();
-    for (index, label) in SETTINGS_TABS.iter().enumerate() {
+    for (index, label) in settings_tabs(state.deepseek_mode).iter().enumerate() {
         if index > 0 {
             tab_spans.push(Span::raw("  "));
         }
@@ -2317,11 +2503,7 @@ mod tests {
     fn picker_state() -> TuiState {
         let mut state = TuiState::new("normal".to_string());
         state.model = "deepseek-flash".to_string();
-        state.models = vec![
-            "deepseek-flash".to_string(),
-            "deepseek-chat".to_string(),
-            "deepseek-v4-pro".to_string(),
-        ];
+        state.models = vec!["deepseek-flash".to_string(), "deepseek-v4-pro".to_string()];
         state
     }
 
@@ -2340,7 +2522,6 @@ mod tests {
         let text = buffer_text(&terminal);
         assert!(text.contains("Select model"));
         assert!(text.contains("DeepSeek Flash"));
-        assert!(text.contains("DeepSeek Chat"));
         assert!(text.contains("DeepSeek V4 Pro"));
         assert!(text.contains("current"));
         assert!(!text.contains("a cat for your codebase"));
@@ -2358,8 +2539,10 @@ mod tests {
             &tx,
         );
         assert!(state.picker.is_none());
-        assert_eq!(state.model, "deepseek-chat");
-        assert!(matches!(rx.try_recv(), Ok(Command::SetModel(model)) if model == "deepseek-chat"));
+        assert_eq!(state.model, "deepseek-v4-pro");
+        assert!(
+            matches!(rx.try_recv(), Ok(Command::SetModel(model)) if model == "deepseek-v4-pro")
+        );
     }
 
     #[test]
@@ -2416,6 +2599,104 @@ mod tests {
         assert!(
             matches!(rx.try_recv(), Ok(Command::SetModel(model)) if model == "deepseek-v4-pro")
         );
+    }
+
+    #[test]
+    fn settings_model_row_opens_picker() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = picker_state();
+        state.settings = Some(SettingsPage {
+            tab: 0,
+            focus: SettingsFocus::List,
+            query: String::new(),
+            selected: Some(1),
+            command: "/config".to_string(),
+        });
+        handle_settings_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &tx,
+            "mock-model",
+            "session-id",
+        );
+        assert!(state.settings.is_none());
+        assert_eq!(
+            state.picker.as_ref().map(|picker| picker.kind),
+            Some(PickerKind::Model)
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn deepseek_tab_renders_and_updates_generation() {
+        let dir = std::env::temp_dir().join(format!(
+            "whisker-deepseek-settings-{}-tab",
+            std::process::id()
+        ));
+        let path = dir.join("settings.json");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = picker_state();
+        state.deepseek_mode = true;
+        state.context_window = 1_048_576;
+        state.generation = GenerationSettings {
+            temperature: Some(0.2),
+            max_tokens: None,
+            top_p: None,
+            thinking: Some(true),
+            reasoning_effort: Some("high".to_string()),
+        };
+        state.deepseek_settings_path = path.clone();
+        state.settings = Some(SettingsPage {
+            tab: 1,
+            focus: SettingsFocus::List,
+            query: String::new(),
+            selected: Some(1),
+            command: "/config".to_string(),
+        });
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut state, "ignored", "session"))
+            .expect("draw");
+        assert!(row_text(&terminal, 4).contains("DeepSeek"));
+        assert!(row_text(&terminal, 11).contains("Model"));
+        assert!(row_text(&terminal, 12).contains("Thinking"));
+        assert!(row_text(&terminal, 12).contains("on"));
+        assert!(row_text(&terminal, 13).contains("Reasoning effort"));
+        assert!(row_text(&terminal, 13).contains("high"));
+        assert!(row_text(&terminal, 14).contains("Max output tokens"));
+        assert!(row_text(&terminal, 14).contains("auto"));
+        assert!(row_text(&terminal, 15).contains("Temperature"));
+        assert!(row_text(&terminal, 15).contains("0.2"));
+        assert!(row_text(&terminal, 16).contains("Context window"));
+        assert!(row_text(&terminal, 16).contains("1M"));
+
+        for selected in [1, 2, 3, 4] {
+            if let Some(page) = state.settings.as_mut() {
+                page.selected = Some(selected);
+            }
+            handle_settings_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &tx,
+                "mock-model",
+                "session-id",
+            );
+        }
+        assert_eq!(state.generation.thinking, Some(false));
+        assert_eq!(state.generation.reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(state.generation.max_tokens, Some(8_192));
+        assert_eq!(state.generation.temperature, Some(0.5));
+        let saved = GenerationSettings::load(&path).expect("saved settings");
+        assert_eq!(saved.thinking, Some(false));
+        assert_eq!(saved.reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(saved.max_tokens, Some(8_192));
+        assert_eq!(saved.temperature, Some(0.5));
+        for _ in 0..4 {
+            assert!(matches!(rx.try_recv(), Ok(Command::SetGeneration(_))));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
