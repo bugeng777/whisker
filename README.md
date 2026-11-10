@@ -7,6 +7,50 @@ plan mode, context compaction).
 
 > Sense first. Pounce once.
 
+## Install
+
+```bash
+curl -fsSL https://github.com/bugeng777/whisker/releases/latest/download/install.sh | bash
+```
+
+Supported: macOS arm64/x64 and Linux x64/arm64. The installer downloads the
+matching release, verifies its SHA256 checksum, and installs to
+`~/.local/bin/whisker`. Interactive sessions check GitHub Releases at most once
+per day and print a reinstall hint when a newer version exists; Whisker never
+updates itself (`update_check = false` disables the check). Pin a version or
+choose another directory:
+
+```bash
+curl -fsSL https://github.com/bugeng777/whisker/releases/latest/download/install.sh \
+  | WHISKER_VERSION=v0.6.1 WHISKER_INSTALL_DIR="$HOME/.local/bin" bash
+```
+
+### Build from source
+
+```bash
+cargo build --release
+./scripts/install.sh          # installs to ~/.local/bin/whisker
+```
+
+Requires a recent stable Rust (tested on 1.96).
+
+## Quick start
+
+```bash
+# 1. Put your key in ~/.whisker/.env (DEEPSEEK_API_KEY=sk-...)
+# 2. Run:
+whisker --cwd /path/to/your/project          # TUI
+whisker --no-tui --cwd /path/to/your/project # line REPL
+whisker -p "fix the failing test" --auto --cwd /path/to/project
+whisker -p "..." --output-format stream-json --cwd /path/to/project
+whisker --plan --cwd /path/to/project
+```
+
+For source builds, replace `whisker` with `./target/release/whisker`.
+
+Keys are resolved from (highest priority first): shell environment, `./.env`,
+`WHISKER_ENV_FILE`, `~/.whisker/.env`.
+
 ## Features
 
 - **OpenAI-compatible providers** with streaming SSE, tool-call assembly, retries,
@@ -47,50 +91,6 @@ plan mode, context compaction).
   and `/cat <pose>` pins one for a few seconds. `/config` opens a Claude-style
   settings page with searchable tabs for settings, status and token usage. The
   header rotates one tip per prompt and shows thinking, stall and tool timers.
-
-## Install
-
-```bash
-curl -fsSL https://github.com/bugeng777/whisker/releases/latest/download/install.sh | bash
-```
-
-Supported: macOS arm64/x64 and Linux x64/arm64. The installer downloads the
-matching release, verifies its SHA256 checksum, and installs to
-`~/.local/bin/whisker`. Interactive sessions check GitHub Releases at most once
-per day and print a reinstall hint when a newer version exists; Whisker never
-updates itself (`update_check = false` disables the check). Pin a version or
-choose another directory:
-
-```bash
-curl -fsSL https://github.com/bugeng777/whisker/releases/latest/download/install.sh \
-  | WHISKER_VERSION=v0.6.0 WHISKER_INSTALL_DIR="$HOME/.local/bin" bash
-```
-
-### Build from source
-
-```bash
-cargo build --release
-./scripts/install.sh          # installs to ~/.local/bin/whisker
-```
-
-Requires a recent stable Rust (tested on 1.96).
-
-## Quick start
-
-```bash
-# 1. Put your key in ~/.whisker/.env (DEEPSEEK_API_KEY=sk-...)
-# 2. Run:
-whisker --cwd /path/to/your/project          # TUI
-whisker --no-tui --cwd /path/to/your/project # line REPL
-whisker -p "fix the failing test" --auto --cwd /path/to/project
-whisker -p "..." --output-format stream-json --cwd /path/to/project
-whisker --plan --cwd /path/to/project
-```
-
-For source builds, replace `whisker` with `./target/release/whisker`.
-
-Keys are resolved from (highest priority first): shell environment, `./.env`,
-`WHISKER_ENV_FILE`, `~/.whisker/.env`.
 
 ## Configuration
 
