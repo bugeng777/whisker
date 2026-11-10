@@ -48,26 +48,43 @@ plan mode, context compaction).
   settings page with searchable tabs for settings, status and token usage. The
   header rotates one tip per prompt and shows thinking, stall and tool timers.
 
-## Build and install
+## Install
+
+```bash
+curl -fsSL https://github.com/bugeng777/whisker/releases/latest/download/install.sh | bash
+```
+
+Supported: macOS arm64/x64 and Linux x64/arm64. The installer downloads the
+matching release, verifies its SHA256 checksum, and installs to
+`~/.local/bin/whisker`. Pin a version or choose another directory:
+
+```bash
+curl -fsSL https://github.com/bugeng777/whisker/releases/latest/download/install.sh \
+  | WHISKER_VERSION=v0.6.0 WHISKER_INSTALL_DIR="$HOME/.local/bin" bash
+```
+
+### Build from source
 
 ```bash
 cargo build --release
 ./scripts/install.sh          # installs to ~/.local/bin/whisker
 ```
 
-Requires a recent stable Rust (tested on 1.96), macOS or Linux.
+Requires a recent stable Rust (tested on 1.96).
 
 ## Quick start
 
 ```bash
-# 1. Put your key in agent/.env (DEEPSEEK_API_KEY=sk-...)
-# 2. Run from the agent directory so .env is picked up:
-./target/release/whisker --cwd /path/to/your/project          # TUI
-./target/release/whisker --no-tui --cwd /path/to/your/project # line REPL
-./target/release/whisker -p "fix the failing test" --auto --cwd /path/to/project
-./target/release/whisker -p "..." --output-format stream-json --cwd /path/to/project
-./target/release/whisker --plan --cwd /path/to/project
+# 1. Put your key in ~/.whisker/.env (DEEPSEEK_API_KEY=sk-...)
+# 2. Run:
+whisker --cwd /path/to/your/project          # TUI
+whisker --no-tui --cwd /path/to/your/project # line REPL
+whisker -p "fix the failing test" --auto --cwd /path/to/project
+whisker -p "..." --output-format stream-json --cwd /path/to/project
+whisker --plan --cwd /path/to/project
 ```
+
+For source builds, replace `whisker` with `./target/release/whisker`.
 
 Keys are resolved from (highest priority first): shell environment, `./.env`,
 `WHISKER_ENV_FILE`, `~/.whisker/.env`.
