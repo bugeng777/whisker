@@ -111,6 +111,11 @@ cp config.example.toml ~/.whisker/config.toml
 如果新机器只是使用、不开发，直接装 release：
 
 ```bash
+brew tap bugeng777/whisker https://github.com/bugeng777/whisker
+brew install whisker
+# 或
+npm install -g @bugeng777/whisker
+# 或
 curl -fsSL https://github.com/bugeng777/whisker/releases/latest/download/install.sh | bash
 ```
 
@@ -143,7 +148,8 @@ git push origin vX.Y.Z
 ```
 
 5. workflow 构建 macOS arm64/x64、Linux x64/arm64，发布 tarball、`install.sh`、
-   `SHA256SUMS`。验证：
+   `SHA256SUMS`，并把同一份校验和写进 `Formula/whisker.rb` 和 `npm/whisker`。
+   仓库 secret `NPM_TOKEN` 存在时同时 `npm publish` `@bugeng777/whisker`。验证：
 
 ```bash
 gh run watch <run-id> --exit-status
@@ -155,8 +161,11 @@ curl -fsSL .../install.sh | WHISKER_INSTALL_DIR=/tmp/whisker-check bash
 
 - 不做自动更新。`crates/cli/src/update.rs` 每天最多检查一次 GitHub Releases，
   每个新版本只提醒一次；`update_check = false` 或 `WHISKER_DISABLE_UPDATE_CHECK=1` 关闭。
+  提醒命令按安装路径选择：`brew update && brew upgrade whisker`、
+  `npm install -g @bugeng777/whisker@latest`，或重跑 curl 安装脚本。
 - 已发布 tag 不要移动；修复用新的 patch 版本。
-- 目前只有 curl 原生安装；Homebrew tap、Windows 安装器尚未做。
+- 安装渠道是 curl、本仓库里的 Homebrew formula，以及 npm 包 `@bugeng777/whisker`
+  （npm 上的 `whisker` 已被无关项目占用）。Windows 安装器尚未做。
 
 ## 6. 当前状态与后续
 
@@ -167,14 +176,14 @@ v0.6.1 已落地并验证：
 - P1：thinking/thought-for、10s stall、工具/总耗时、tips 每轮轮换。
 - P2：Session/Compact hooks、subagent 深度/回合/并发、opt-in deferred tools + tool_search、
   grep 显式文件修复。
-- 发布：四平台 release、校验和安装脚本、每日更新提醒（不自动更新）。
+- 发布：四平台 release、校验和安装脚本、Homebrew formula、npm 安装包、每日更新提醒（不自动更新）。
 
 残余（来自 `docs/research/CLAUDE_10_DIRECTION_VALIDATION.md`）：
 
 - P3 brief/transcript/无障碍/teammate tree：仅静态证据，未移植。
 - Anthropic 端点兼容：未跑（需要 key）。
 - 1M compaction、第二次提醒周期、交互式 task 路径：未实测。
-- Homebrew tap、Windows 安装器、macOS 签名/公证：未做。
+- Windows 安装器、macOS 签名/公证：未做。npm 发布还需要仓库 secret `NPM_TOKEN`。
 
 下一步原则：先补证据再实现；新功能默认 opt-in；P3 不确定就继续留在文档里，
 不要为了“像 Claude”而加入未验证的行为。

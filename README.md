@@ -12,16 +12,39 @@ architecture, validation workflow, setup and release process.
 
 ## Install
 
+macOS arm64/x64 and Linux x64/arm64. Interactive sessions check GitHub Releases
+at most once per day and print the upgrade command for the install that is
+actually running. Whisker never updates itself (`update_check = false` disables
+the check).
+
+### Homebrew
+
+```bash
+brew tap bugeng777/whisker https://github.com/bugeng777/whisker
+brew install whisker
+```
+
+Upgrade with `brew update && brew upgrade whisker`.
+
+### npm
+
+```bash
+npm install -g @bugeng777/whisker
+```
+
+The command it installs is `whisker`. The package is scoped because the npm
+name `whisker` already belongs to an unrelated template engine. Upgrade with
+`npm install -g @bugeng777/whisker@latest`.
+
+### Shell installer
+
 ```bash
 curl -fsSL https://github.com/bugeng777/whisker/releases/latest/download/install.sh | bash
 ```
 
-Supported: macOS arm64/x64 and Linux x64/arm64. The installer downloads the
-matching release, verifies its SHA256 checksum, and installs to
-`~/.local/bin/whisker`. Interactive sessions check GitHub Releases at most once
-per day and print a reinstall hint when a newer version exists; Whisker never
-updates itself (`update_check = false` disables the check). Pin a version or
-choose another directory:
+The installer downloads the matching release, verifies its SHA256 checksum, and
+installs to `~/.local/bin/whisker`. Run the same command again to upgrade. Pin
+a version or choose another directory:
 
 ```bash
 curl -fsSL https://github.com/bugeng777/whisker/releases/latest/download/install.sh \

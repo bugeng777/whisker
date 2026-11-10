@@ -11,8 +11,9 @@ profile = "deepseek"
 # Opt-in deferred tools: hidden tools are discovered through tool_search.
 # deferred_tools = ["read", "grep"]
 # defer_mcp_tools = true
-# Check GitHub Releases at most once per day and print a reinstall hint when a
-# newer version exists. This never updates Whisker automatically.
+# Check GitHub Releases at most once per day and print an upgrade hint when a
+# newer version exists. Homebrew, npm, and the curl installer each get their
+# own command. This never updates Whisker automatically.
 # update_check = true
 # Auto-compaction threshold. The default is 90% of the effective context window
 # (Claude's validated 180k/200k threshold); compact_window takes precedence as an
