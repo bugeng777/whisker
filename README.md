@@ -7,6 +7,9 @@ plan mode, context compaction).
 
 > Sense first. Pounce once.
 
+New machine or contributing? See [DEVELOPMENT.md](DEVELOPMENT.md) for the
+architecture, validation workflow, setup and release process.
+
 ## Install
 
 ```bash
