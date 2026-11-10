@@ -248,3 +248,7 @@ line REPL, TUI, packaging, stream-json output, eval harness (6/6 baseline), CI.
 Out of scope for this release: full IDE plugins / remote bridge UI (stream-json is the
 integration primitive), voice, and OS-level computer use. Windows is supported through
 the PowerShell tool but has not been end-to-end tested on a Windows host.
+
+## License
+
+Licensed under the [MIT License](LICENSE).
