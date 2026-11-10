@@ -1,0 +1,22 @@
+[package]
+name = "agent-tools"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agent-core.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+regex.workspace = true
+ignore.workspace = true
+globset.workspace = true
+shell-words.workspace = true
+similar.workspace = true
+tree-sitter.workspace = true
+tree-sitter-bash.workspace = true
+dirs.workspace = true
+tracing.workspace = true
+serde.workspace = true
+url.workspace = true

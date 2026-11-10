@@ -1,0 +1,66 @@
+# Copy to ~/.whisker/config.toml
+
+[agent]
+profile = "deepseek"
+# Optional safety cap. Omit to wait for the model's finish signal (stop/tool-calls/max-tokens).
+# max_turns = 40
+temperature = 0.2
+# Restrict bash file writes to the workspace and temp dirs (macOS seatbelt).
+sandbox = false
+
+[providers.deepseek]
+base_url = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"
+model = "deepseek-flash"
+# Options shown by the in-session /model picker (omitted = DeepSeek defaults).
+models = ["deepseek-flash", "deepseek-chat", "deepseek-v4-pro"]
+# true = the model accepts image parts (deepseek-flash/deepseek-chat).
+vision = true
+context_window = 1048576
+# "drop" strips reasoning_content from later requests (default).
+# Use "echo" for providers that require it to be sent back.
+reasoning_content = "drop"
+
+# Any OpenAI-compatible endpoint works. Examples:
+# [providers.kimi]
+# base_url = "https://api.moonshot.cn/v1"
+# api_key_env = "MOONSHOT_API_KEY"
+# model = "kimi-k2-0905-preview"
+# context_window = 131072
+
+[permissions]
+allow = []
+deny = []
+# Rules answered with "always" in the approval prompt are appended to ~/.whisker/permissions.allow.
+
+[hooks]
+# Shell commands run before/after every tool call. Non-zero exit blocks the tool
+# (pre) or marks the result as failed (post). The tool args are passed as JSON on
+# stdin and in WHISKER_TOOL_ARGS; WHISKER_TOOL_NAME and WHISKER_HOOK_PHASE are also set.
+# pre_tool_use = ["echo \"$WHISKER_TOOL_NAME\""]
+# post_tool_use = []
+
+# MCP sidecars are the extension mechanism.
+# [mcp_servers.filesystem]
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+
+# Browser capability as a sidecar (no Rust implementation needed).
+# [mcp_servers.playwright]
+# command = "npx"
+# args = ["-y", "@playwright/mcp@latest"]
+
+# Remote MCP server over Streamable HTTP (JSON or SSE responses).
+# [mcp_servers.remote]
+# url = "https://example.com/mcp"
+
+# Language servers, used by the lsp tool (diagnostics/definition/hover/symbols).
+# [lsp.rust]
+# command = "rust-analyzer"
+# extensions = ["rs"]
+#
+# [lsp.typescript]
+# command = "typescript-language-server"
+# args = ["--stdio"]
+# extensions = ["ts", "tsx", "js", "jsx"]
+# language_id = "typescript"

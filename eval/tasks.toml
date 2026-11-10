@@ -1,0 +1,35 @@
+[[task]]
+name = "fix-subtraction"
+fixture = "fix-subtraction"
+prompt = "The test in this directory fails. Find and fix the bug in calc.py, then run the test to verify the fix."
+verify = "python3 test_calc.py"
+
+[[task]]
+name = "create-greeting"
+fixture = "create-greeting"
+prompt = "Create a file named greeting.txt containing exactly one line: hello whisker"
+verify = "test \"$(cat greeting.txt)\" = 'hello whisker'"
+
+[[task]]
+name = "update-timeout"
+fixture = "update-timeout"
+prompt = "The deployment check expects a timeout of 30 seconds, but config.json still has the old value. Update config.json to 30 and run the check script to verify."
+verify = "bash check.sh"
+
+[[task]]
+name = "rename-function"
+fixture = "rename-function"
+prompt = "The test imports calculate_total, but app.py still defines compute_total. Rename the function in app.py so the test passes."
+verify = "python3 test_app.py"
+
+[[task]]
+name = "fix-import"
+fixture = "fix-import"
+prompt = "main.py imports greet from helper.py, but the function is named hello. Fix the import so main.py prints 'hi whisker'."
+verify = "test \"$(python3 main.py)\" = 'hi whisker'"
+
+[[task]]
+name = "node-config"
+fixture = "node-config"
+prompt = "app.js reads settings.port but settings.js exports PORT. Fix the mismatch so node app.js prints 'listening on 8080'."
+verify = "node app.js | grep -q 'listening on 8080'"

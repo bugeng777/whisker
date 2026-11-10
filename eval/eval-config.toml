@@ -1,0 +1,10 @@
+[agent]
+max_turns = 20
+temperature = 0.1
+
+[providers.deepseek]
+base_url = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"
+model = "deepseek-flash"
+vision = true
+context_window = 1048576
