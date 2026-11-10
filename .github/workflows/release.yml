@@ -50,6 +50,10 @@ jobs:
           files=(README.md config.example.toml)
           if [ -f LICENSE ]; then files+=(LICENSE); fi
           cp "${files[@]}" "dist/${{ matrix.target }}/"
+          if [ -d .whisker/skills/impeccable ]; then
+            mkdir -p "dist/${{ matrix.target }}/skills"
+            cp -a .whisker/skills/impeccable "dist/${{ matrix.target }}/skills/"
+          fi
           tar -C "dist/${{ matrix.target }}" -czf "dist/whisker-${{ matrix.target }}.tar.gz" .
       - uses: actions/upload-artifact@v4
         with:

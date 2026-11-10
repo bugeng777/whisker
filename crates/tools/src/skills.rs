@@ -27,6 +27,9 @@ pub struct SkillCatalog {
 impl SkillCatalog {
     pub fn load(cwd: &Path) -> Self {
         let mut map: BTreeMap<String, Skill> = BTreeMap::new();
+        for dir in bundled_skill_dirs() {
+            load_dir(&dir, &mut map);
+        }
         let home = dirs::home_dir();
 
         if let Some(home) = &home {
@@ -77,6 +80,32 @@ impl SkillCatalog {
         }
         out
     }
+}
+
+/// Skills shipped next to the binary, or in Homebrew's `share/whisker/skills`.
+fn bundled_skill_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    let Ok(exe) = std::env::current_exe() else {
+        return dirs;
+    };
+    let Some(parent) = exe.parent() else {
+        return dirs;
+    };
+    dirs.push(parent.join("skills"));
+    dirs.push(parent.join("../share/whisker/skills"));
+    dirs
+}
+
+pub fn render_skill(skill: &Skill) -> String {
+    let dir = Path::new(&skill.path)
+        .parent()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    format!(
+        "# Skill: {name}\n\nSkill directory: {dir}\nUse this directory as <skill-base-dir>.\n\n{body}\n\n[Follow these instructions for the current task.]",
+        name = skill.name,
+        body = skill.body,
+    )
 }
 
 fn load_dir(dir: &Path, map: &mut BTreeMap<String, Skill>) {
@@ -260,10 +289,7 @@ impl Tool for SkillTool {
                 self.catalog.names().join(", ")
             )));
         };
-        Ok(ToolOutput::ok(format!(
-            "# Skill: {}\n\n{}\n\n[Follow these instructions for the current task.]",
-            skill.name, skill.body
-        )))
+        Ok(ToolOutput::ok(render_skill(skill)))
     }
 }
 
@@ -287,6 +313,30 @@ mod tests {
         assert_eq!(skill.name, "debug");
         assert_eq!(skill.description, "Use this when debugging.");
         assert!(skill.body.contains("More detail."));
+    }
+
+    #[test]
+    fn render_includes_skill_directory() {
+        let skill = Skill {
+            name: "impeccable".to_string(),
+            description: "Design".to_string(),
+            body: "Run <skill-base-dir>/scripts/impeccable context".to_string(),
+            path: "/opt/whisker/skills/impeccable/SKILL.md".to_string(),
+        };
+        let rendered = render_skill(&skill);
+        assert!(rendered.contains("Skill directory: /opt/whisker/skills/impeccable"));
+        assert!(rendered.contains("<skill-base-dir>"));
+    }
+
+    #[test]
+    fn repo_impeccable_skill_loads() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let catalog = SkillCatalog::load(&root);
+        let skill = catalog.get("impeccable").expect("bundled impeccable skill");
+        assert!(skill.description.to_lowercase().contains("design"));
+        let rendered = render_skill(skill);
+        assert!(rendered.contains("scripts/impeccable"));
+        assert!(rendered.contains("impeccable"));
     }
 
     #[test]

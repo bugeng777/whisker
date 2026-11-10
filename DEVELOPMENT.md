@@ -166,6 +166,9 @@ curl -fsSL .../install.sh | WHISKER_INSTALL_DIR=/tmp/whisker-check bash
 - 已发布 tag 不要移动；修复用新的 patch 版本。
 - 安装渠道是 curl、本仓库里的 Homebrew formula，以及 npm 包 `@bugeng777/whisker`
   （npm 上的 `whisker` 已被无关项目占用）。Windows 安装器尚未做。
+- 内置 skill：`.whisker/skills/impeccable`（Apache-2.0，上游 pbakaus/impeccable）。
+  发布包会带上它；curl 装到 `~/.whisker/skills`，Homebrew 装到 share，npm 放在二进制旁边。
+  会话里用 `/impeccable`。
 
 ## 6. 当前状态与后续
 

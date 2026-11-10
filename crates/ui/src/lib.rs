@@ -28,6 +28,11 @@ pub enum Command {
     Clear,
     ShowPlan,
     ShowSkills,
+    /// Invoke a loaded skill by its slash name, for example `/impeccable`.
+    Skill {
+        name: String,
+        args: String,
+    },
     Quit,
 }
 
@@ -144,11 +149,25 @@ pub async fn run_agent(mut agent: Agent, mut commands: mpsc::UnboundedReceiver<C
                 } else {
                     let mut text = String::from("Available skills:\n");
                     for (name, description) in &agent.config.skills {
-                        text.push_str(&format!("- {name}: {description}\n"));
+                        text.push_str(&format!("- /{name}: {description}\n"));
                     }
                     text
                 };
                 agent.emit(Event::Notice { message });
+            }
+            Command::Skill { name, args } => {
+                if agent.config.skills.iter().any(|(skill, _)| skill == &name) {
+                    let text = skill_invocation(&name, &args);
+                    if let Err(err) = agent.run_turn(text).await {
+                        agent.emit(Event::Error {
+                            message: err.to_string(),
+                        });
+                    }
+                } else {
+                    agent.emit(Event::Notice {
+                        message: format!("unknown command /{name}; try /help or /skills"),
+                    });
+                }
             }
             Command::Quit => break,
         }
@@ -176,6 +195,34 @@ fn out_line(text: &str) {
 
 fn prompt() {
     out("\n\x1b[38;5;173m❯\x1b[0m ");
+}
+
+pub(crate) fn skill_command(command: &str, args: &str) -> Option<Command> {
+    let name = command.strip_prefix('/')?;
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return None;
+    }
+    Some(Command::Skill {
+        name: name.to_string(),
+        args: args.trim().to_string(),
+    })
+}
+
+pub(crate) fn skill_invocation(name: &str, args: &str) -> String {
+    let args = args.trim();
+    if args.is_empty() {
+        format!(
+            "Use the `{name}` skill. Load it with the skill tool and follow it. The tool result names the skill directory; use it as <skill-base-dir>."
+        )
+    } else {
+        format!(
+            "Use the `{name}` skill.\nRequest: {args}\nLoad it with the skill tool and follow it. The tool result names the skill directory; use it as <skill-base-dir>."
+        )
+    }
 }
 
 pub(crate) fn truncate(text: &str, max_chars: usize) -> String {
@@ -558,6 +605,7 @@ fn handle_slash(
             out_line("/mode <m>    normal | plan | auto");
             out_line("/plan        show the recorded plan");
             out_line("/skills      list available skills");
+            out_line("/<skill>     run a skill, e.g. /impeccable polish");
             out_line("/cat <pose>  idle | scanning | working | success");
             out_line("/compact     summarize history now");
             out_line("/clear       clear conversation history");
@@ -596,7 +644,12 @@ fn handle_slash(
             ));
         }
         other => {
-            out_line(&format!("unknown command {other}; try /help"));
+            let args = parts.collect::<Vec<_>>().join(" ");
+            if let Some(command) = skill_command(other, &args) {
+                let _ = cmd_tx.send(command);
+            } else {
+                out_line(&format!("unknown command {other}; try /help"));
+            }
         }
     }
 }
@@ -717,5 +770,26 @@ async fn read_line(key_rx: &mut mpsc::UnboundedReceiver<KeyEvent>) -> Option<Str
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slash_skill_becomes_an_invocation() {
+        match skill_command("/impeccable", "polish the header") {
+            Some(Command::Skill { name, args }) => {
+                assert_eq!(name, "impeccable");
+                assert_eq!(args, "polish the header");
+            }
+            other => panic!("expected skill command, got {other:?}"),
+        }
+        assert!(skill_command("/bad name", "").is_none());
+        let prompt = skill_invocation("impeccable", "audit");
+        assert!(prompt.contains("impeccable"));
+        assert!(prompt.contains("Request: audit"));
+        assert!(prompt.contains("<skill-base-dir>"));
     }
 }

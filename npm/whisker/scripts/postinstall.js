@@ -99,6 +99,12 @@ async function install() {
     fs.chmodSync(staged, 0o755);
     fs.renameSync(staged, dest);
     fs.writeFileSync(installed, `${version}\n`);
+    const skills = path.join(tmp, "skills");
+    const skillDest = path.join(VENDOR, "skills");
+    if (fs.existsSync(skills)) {
+      fs.rmSync(skillDest, { recursive: true, force: true });
+      fs.cpSync(skills, skillDest, { recursive: true });
+    }
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }

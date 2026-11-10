@@ -28,6 +28,9 @@ class Whisker < Formula
 
   def install
     bin.install "whisker"
+    if File.directory?("skills/impeccable")
+      (pkgshare/"skills").install "skills/impeccable"
+    end
   end
 
   test do

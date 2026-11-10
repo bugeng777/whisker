@@ -1520,6 +1520,7 @@ fn handle_slash(state: &mut TuiState, text: &str, cmd_tx: &mpsc::UnboundedSender
             state.push_line("/mode [m]    choose a mode (↑/↓)", dim());
             state.push_line("/plan        show the recorded plan", dim());
             state.push_line("/skills      list available skills", dim());
+            state.push_line("/<skill>     run a skill, e.g. /impeccable polish", dim());
             state.push_line("/cat <pose>  idle | scanning | working | success", dim());
             state.push_line("/compact     summarize history now", dim());
             state.push_line("/clear       clear conversation history", dim());
@@ -1565,7 +1566,14 @@ fn handle_slash(state: &mut TuiState, text: &str, cmd_tx: &mpsc::UnboundedSender
                 dim(),
             );
         }
-        other => state.push_line(&format!("unknown command {other}; try /help"), dim()),
+        other => {
+            let args = parts.collect::<Vec<_>>().join(" ");
+            if let Some(command) = crate::skill_command(other, &args) {
+                let _ = cmd_tx.send(command);
+            } else {
+                state.push_line(&format!("unknown command {other}; try /help"), dim());
+            }
+        }
     }
 }
 
@@ -3300,6 +3308,15 @@ mod tests {
             KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
             &tx,
         );
+
+        handle_slash(&mut state, "/impeccable polish the settings", &tx);
+        match rx.try_recv() {
+            Ok(Command::Skill { name, args }) => {
+                assert_eq!(name, "impeccable");
+                assert_eq!(args, "polish the settings");
+            }
+            other => panic!("expected skill command, got {other:?}"),
+        }
 
         handle_slash(&mut state, "/model deepseek-v4-pro", &tx);
         assert!(state.picker.is_none());
