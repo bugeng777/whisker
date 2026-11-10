@@ -1,4 +1,5 @@
 mod config;
+mod update;
 
 use std::collections::{HashSet, VecDeque};
 use std::io::{IsTerminal, Write};
@@ -309,6 +310,19 @@ async fn main() -> Result<()> {
 
     let (event_tx, event_rx) = mpsc::unbounded_channel::<Event>();
     let (interaction_tx, interaction_rx) = mpsc::unbounded_channel();
+
+    if args.print.is_none()
+        && config.agent.update_check.unwrap_or(true)
+        && std::env::var("WHISKER_DISABLE_UPDATE_CHECK").is_err()
+    {
+        let update_tx = event_tx.clone();
+        let update_home = home.clone();
+        tokio::spawn(async move {
+            if let Some(message) = update::check_for_update(&update_home).await {
+                let _ = update_tx.send(Event::Notice { message });
+            }
+        });
+    }
 
     let interactor: Arc<dyn Interactor> = if args.print.is_some() {
         Arc::new(HeadlessInteractor {

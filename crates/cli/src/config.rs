@@ -56,6 +56,9 @@ pub struct AgentSection {
     /// Defer every `mcp__*` tool behind `tool_search` (opt-in).
     #[serde(default)]
     pub defer_mcp_tools: Option<bool>,
+    /// Check GitHub Releases daily and show a reinstall hint (default true).
+    #[serde(default)]
+    pub update_check: Option<bool>,
     pub temperature: Option<f32>,
     /// Auto-compaction ratio of the context window (default 0.9).
     #[serde(default)]
@@ -221,6 +224,18 @@ mod tests {
         assert_eq!(provider.max_tokens, Some(65_536));
         assert_eq!(provider.top_p, Some(0.95));
         assert_eq!(provider.temperature, Some(0.2));
+    }
+
+    #[test]
+    fn parses_update_check() {
+        let config: Config = toml::from_str(
+            r#"
+            [agent]
+            update_check = false
+            "#,
+        )
+        .expect("config");
+        assert_eq!(config.agent.update_check, Some(false));
     }
 
     #[test]
