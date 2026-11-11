@@ -175,7 +175,7 @@ fn out_line(text: &str) {
 }
 
 fn prompt() {
-    out("\n\x1b[38;5;33m▌\x1b[0m \x1b[1m›\x1b[0m ");
+    out("\n\x1b[38;5;173m❯\x1b[0m ");
 }
 
 pub(crate) fn truncate(text: &str, max_chars: usize) -> String {
@@ -377,7 +377,7 @@ pub async fn run_repl(
                         waiting = false;
                     }
                     out(&format!(
-                        "\n\x1b[2m⏺ {}\x1b[0m\n",
+                        "\n\x1b[38;5;173m⏺ {}\x1b[0m\n",
                         describe_tool(&name, &args)
                     ));
                 }
@@ -385,7 +385,7 @@ pub async fn run_repl(
                     content, is_error, ..
                 } => render_result(&content, is_error),
                 Event::ToolDenied { reason, .. } => {
-                    out_line(&format!("  \x1b[31m⎿ denied: {reason}\x1b[0m"));
+                    out_line(&format!("  \x1b[31m⎿  denied: {reason}\x1b[0m"));
                 }
                 Event::ToolProgress { name, text, .. } => {
                     if name == "agent" || std::env::var("WHISKER_SHOW_TOOL_PROGRESS").is_ok() {
@@ -494,12 +494,14 @@ pub async fn run_repl(
 pub(crate) fn describe_tool(name: &str, args: &serde_json::Value) -> String {
     let arg = |key: &str| args.get(key).and_then(|value| value.as_str()).unwrap_or("");
     match name {
-        "bash" => format!("bash({})", truncate(arg("command"), 120)),
-        "read" | "write" | "edit" => format!("{name}({})", arg("path")),
-        "grep" => format!("grep({})", truncate(arg("pattern"), 80)),
-        "glob" => format!("glob({})", truncate(arg("pattern"), 80)),
-        "todo_write" => "update todos".to_string(),
-        "ask_user" => format!("ask_user({})", truncate(arg("question"), 100)),
+        "bash" => format!("Bash({})", truncate(arg("command"), 120)),
+        "read" => format!("Read({})", arg("path")),
+        "write" => format!("Write({})", arg("path")),
+        "edit" => format!("Edit({})", arg("path")),
+        "grep" => format!("Grep({})", truncate(arg("pattern"), 80)),
+        "glob" => format!("Glob({})", truncate(arg("pattern"), 80)),
+        "todo_write" => "Update todos".to_string(),
+        "ask_user" => format!("Ask user({})", truncate(arg("question"), 100)),
         _ => name.to_string(),
     }
 }
@@ -511,7 +513,7 @@ fn render_result(content: &str, is_error: bool) {
     let mut text = String::new();
     for (index, line) in lines.iter().take(shown).enumerate() {
         if index == 0 {
-            text.push_str(&format!("  {color}⎿ {}\x1b[0m\n", truncate(line, 160)));
+            text.push_str(&format!("  {color}⎿  {}\x1b[0m\n", truncate(line, 160)));
         } else {
             text.push_str(&format!("     {color}{}\x1b[0m\n", truncate(line, 160)));
         }

@@ -363,12 +363,12 @@ pub fn art_lines(pose: Pose, color: bool) -> Vec<String> {
 
 pub fn banner(model: &str, session: &str, mode: &str, with_art: bool) -> Vec<String> {
     let color = color_enabled();
-    let bold = if color { "\x1b[1;38;5;39m" } else { "" };
+    let bold = if color { "\x1b[1;38;5;173m" } else { "" };
     let dim = if color { "\x1b[2m" } else { "" };
     let reset = if color { "\x1b[0m" } else { "" };
 
     let info = vec![
-        format!("{bold}whisker{reset} {dim}· a cat for your codebase{reset}"),
+        format!("{bold}✻ whisker{reset} {dim}· a cat for your codebase{reset}"),
         format!("{dim}model    {reset}{model}"),
         format!("{dim}session  {reset}{session}"),
         format!("{dim}mode     {reset}{mode}"),
@@ -468,8 +468,13 @@ pub fn random_verb() -> &'static str {
     pick_verb(seed)
 }
 
+pub fn sparkle(frame: usize) -> &'static str {
+    const FRAMES: [&str; 5] = ["✻", "✽", "✶", "✳", "✢"];
+    FRAMES[frame % FRAMES.len()]
+}
+
 pub fn spinner(frame: usize) -> String {
-    format!("{}  {}", MARK, dots(frame))
+    format!("{}  {}", sparkle(frame), dots(frame))
 }
 
 pub fn terminal_title(model: &str) -> String {

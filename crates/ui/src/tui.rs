@@ -14,7 +14,7 @@ use crossterm::terminal::{
 };
 use crossterm::{cursor, execute};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap};
@@ -25,14 +25,15 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::brand::{self, Pose};
 use crate::{describe_tool, truncate, Command, Interaction};
 
-const ACCENT: Color = Color::Indexed(208);
+const ACCENT: Color = Color::Indexed(173);
 const OK: Color = Color::Indexed(114);
 const PLAN: Color = Color::Indexed(179);
-const DIM: Color = Color::DarkGray;
-const FOCUS: Color = Color::Indexed(153);
+const DIM: Color = Color::Indexed(244);
+const BORDER: Color = Color::Indexed(238);
+const FOCUS: Color = Color::Indexed(252);
 const MUTED: Color = Color::Indexed(246);
-const RED: Color = Color::Rgb(255, 100, 100);
-const YELLOW: Color = Color::Rgb(230, 190, 80);
+const RED: Color = Color::Indexed(203);
+const YELLOW: Color = Color::Indexed(180);
 const SETTINGS_COL_WIDTH: usize = 47;
 const SETTINGS_TABS: &[&str] = &["Settings", "Status", "Usage"];
 const DEEPSEEK_EFFORTS: &[&str] = &["low", "high", "max"];
@@ -388,12 +389,7 @@ impl TuiState {
         if let Some(start) = self.thinking_since {
             let elapsed = now.saturating_duration_since(start);
             return (
-                format!(
-                    "{} {} · {}s",
-                    thinking_word(elapsed),
-                    brand::dots(self.spinner).trim_end(),
-                    elapsed.as_secs()
-                ),
+                format!("{} · {}s", thinking_word(elapsed), elapsed.as_secs()),
                 ACCENT,
             );
         }
@@ -424,11 +420,10 @@ impl TuiState {
             .map(|start| now.saturating_duration_since(start))
             .unwrap_or_default();
         let verb = self.activity_word(32);
-        let dots = brand::dots(self.spinner).trim_end();
         let text = if elapsed.as_secs() >= 1 {
-            format!("{verb} {dots} · {}s", elapsed.as_secs())
+            format!("{verb} · {}s", elapsed.as_secs())
         } else {
-            format!("{verb} {dots}")
+            verb
         };
         let color = if stalled {
             YELLOW
@@ -507,7 +502,7 @@ fn input_display(state: &TuiState) -> &str {
 }
 
 fn input_text_width(total_width: u16) -> usize {
-    (total_width as usize).saturating_sub(3).max(1)
+    (total_width as usize).saturating_sub(5).max(1)
 }
 
 fn wrap_input(text: &str, width: usize) -> Vec<String> {
@@ -943,8 +938,6 @@ fn display_lines(chunks: &[Chunk], width: u16) -> Vec<Line<'static>> {
         let text: String = row.iter().map(|(ch, _)| *ch).collect();
         let (marker, body_start) = if text.starts_with("❯ ") {
             (Some('❯'), 2)
-        } else if text.starts_with("● ") {
-            (Some('●'), 2)
         } else if text.starts_with("⏺ ") {
             (Some('⏺'), 2)
         } else if text.starts_with("  ") {
@@ -1707,7 +1700,7 @@ fn handle_event(state: &mut TuiState, event: Event) {
             state.scanning = matches!(name.as_str(), "read" | "grep" | "glob" | "lsp" | "skill");
             state.ensure_blank_line();
             state.push_line(
-                &format!("● {}", describe_tool(&name, &args)),
+                &format!("⏺ {}", describe_tool(&name, &args)),
                 Style::default().fg(ACCENT),
             );
         }
@@ -1737,14 +1730,14 @@ fn handle_event(state: &mut TuiState, event: Event) {
                 dim()
             };
             for line in content.lines().take(4) {
-                state.push_line(&format!("  └ {}", truncate(line, 160)), style);
+                state.push_line(&format!("  ⎿  {}", truncate(line, 160)), style);
             }
         }
         Event::ToolDenied { id, reason, .. } => {
             state.active_tools.remove(&id);
             state.last_stream_at = Some(Instant::now());
             state.ensure_line_start();
-            state.push_line(&format!("  └ denied: {reason}"), Style::default().fg(RED));
+            state.push_line(&format!("  ⎿  denied: {reason}"), Style::default().fg(RED));
         }
         Event::Reminder { kind, .. } => {
             state.ensure_line_start();
@@ -1878,7 +1871,7 @@ fn render(frame: &mut Frame, state: &mut TuiState, model: &str, session: &str) {
     }
     constraints.push(Constraint::Length(1));
     constraints.push(Constraint::Length(
-        input_view_rows(state, area.width, area.height) as u16 + 1,
+        input_view_rows(state, area.width, area.height) as u16 + 2,
     ));
     constraints.push(Constraint::Length(1));
     let layout = Layout::default()
@@ -1905,7 +1898,7 @@ fn render(frame: &mut Frame, state: &mut TuiState, model: &str, session: &str) {
         index += 1;
     }
     render_hint(frame, layout[index], state);
-    render_input(frame, layout[index + 1], state, &display_model);
+    render_input(frame, layout[index + 1], state);
     render_footer(frame, layout[index + 2], state);
 }
 
@@ -1969,7 +1962,7 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &TuiState, model: &str,
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "─".repeat(width),
-            Style::default().fg(FOCUS),
+            Style::default().fg(BORDER),
         ))),
         Rect {
             x: area.x,
@@ -1985,7 +1978,7 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &TuiState, model: &str,
             tab_spans.push(Span::raw("  "));
         }
         let style = if index == page.tab {
-            Style::default().fg(FOCUS).add_modifier(Modifier::BOLD)
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
@@ -2023,7 +2016,11 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &TuiState, model: &str,
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(FOCUS))
+                .border_style(Style::default().fg(if page.focus == SettingsFocus::Search {
+                    ACCENT
+                } else {
+                    BORDER
+                }))
                 .padding(Padding::new(1, 1, 0, 0)),
         ),
         search_rect,
@@ -2057,7 +2054,7 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &TuiState, model: &str,
         let pad = SETTINGS_COL_WIDTH.saturating_sub(label_width + value_width);
         let marker = if selected { "❯ " } else { "  " };
         let style = if selected {
-            Style::default().fg(FOCUS)
+            Style::default().fg(FOCUS).add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
@@ -2164,7 +2161,7 @@ fn render_picker(frame: &mut Frame, area: Rect, state: &TuiState) {
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "─".repeat(width),
-            Style::default().fg(FOCUS),
+            Style::default().fg(BORDER),
         ))),
         Rect {
             x: area.x,
@@ -2176,7 +2173,7 @@ fn render_picker(frame: &mut Frame, area: Rect, state: &TuiState) {
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             format!("  {}", picker.title),
-            Style::default().fg(FOCUS).add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ))),
         Rect {
             x: area.x,
@@ -2289,7 +2286,7 @@ fn render_picker(frame: &mut Frame, area: Rect, state: &TuiState) {
             Paragraph::new(Line::from(Span::styled(
                 format!("  Settings · {}", model_label(model)),
                 if settings_focused {
-                    Style::default().fg(FOCUS).add_modifier(Modifier::BOLD)
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
                 } else {
                     dim()
                 },
@@ -2385,37 +2382,22 @@ fn render_welcome(frame: &mut Frame, area: Rect, state: &TuiState, model: &str) 
     let rect = Rect {
         x: area.x + 2,
         y: area.y,
-        width: 62.min(area.width.saturating_sub(4)),
+        width: area.width.saturating_sub(4),
         height: 8,
     };
     if rect.width < 30 {
         return;
     }
     let pose = state.current_pose();
-    let border = match pose {
-        Pose::Working => ACCENT,
-        Pose::Scanning => PLAN,
-        Pose::Success => OK,
-        Pose::Idle => DIM,
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border))
-        .padding(Padding::new(1, 1, 1, 1));
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-    if inner.height < 4 || inner.width < 24 {
-        return;
-    }
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Length(14),
-            Constraint::Length(2),
+            Constraint::Length(3),
             Constraint::Min(20),
         ])
-        .split(inner);
+        .split(rect);
+    let info_width = cols[2].width as usize;
 
     let cat = compact_cat_lines(brand::compact_cells(pose, state.mascot_frame));
     frame.render_widget(Paragraph::new(cat), cols[0]);
@@ -2440,32 +2422,87 @@ fn render_welcome(frame: &mut Frame, area: Rect, state: &TuiState, model: &str) 
         };
         (text, color)
     };
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(
-                "whisker",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  a cat for your codebase", dim()),
-        ]),
-        Line::from(vec![
-            Span::styled(format!("model  {model}"), dim()),
-            Span::raw("    "),
-            Span::styled(
-                format!("mode  {}", state.mode),
-                Style::default().fg(mode_color),
-            ),
-        ]),
-        Line::from(Span::styled(status, Style::default().fg(status_color))),
-        if state.show_tips {
-            let width = cols[2].width.saturating_sub(5) as usize;
-            let tip = truncate(TIPS[state.tip_index % TIPS.len()], width.max(1));
-            Line::from(Span::styled(format!("Tip: {tip}"), dim()))
-        } else {
-            Line::from("")
-        },
+
+    let mut title = vec![
+        Span::styled("✻ ", Style::default().fg(ACCENT)),
+        Span::styled(
+            "whisker",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  a cat for your codebase", dim()),
     ];
-    frame.render_widget(Paragraph::new(lines), cols[2]);
+    let mut status_spans = Vec::new();
+    if state.busy {
+        let glyph = if state.reduce_motion {
+            "✻"
+        } else {
+            brand::sparkle(state.spinner)
+        };
+        status_spans.push(Span::styled(
+            format!("{glyph} "),
+            Style::default().fg(ACCENT),
+        ));
+    }
+    status_spans.push(Span::styled(status, Style::default().fg(status_color)));
+    let title_width = span_width(&title);
+    let status_width = span_width(&status_spans);
+    if info_width >= title_width + status_width + 2 {
+        title.push(Span::raw(
+            " ".repeat(info_width - title_width - status_width),
+        ));
+        title.extend(status_spans);
+    }
+
+    let mut meta = vec![
+        Span::styled("model  ", dim()),
+        Span::raw(model.to_string()),
+        Span::raw("    "),
+        Span::styled("mode  ", dim()),
+        Span::styled(state.mode.clone(), Style::default().fg(mode_color)),
+    ];
+    let tokens = format!("tokens {} / {}", state.total_in, state.total_out);
+    let meta_width = span_width(&meta);
+    let tokens_width = UnicodeWidthStr::width(tokens.as_str());
+    if info_width >= meta_width + tokens_width + 2 {
+        meta.push(Span::raw(
+            " ".repeat(info_width - meta_width - tokens_width),
+        ));
+        meta.push(Span::styled(tokens, dim()));
+    }
+
+    let tip = if state.show_tips {
+        let tip = truncate(
+            TIPS[state.tip_index % TIPS.len()],
+            info_width.saturating_sub(6).max(1),
+        );
+        Line::from(Span::styled(format!("Tip: {tip}"), dim()))
+    } else {
+        Line::from("")
+    };
+    frame.render_widget(
+        Paragraph::new(vec![Line::from(title), Line::from(meta), tip]),
+        cols[2],
+    );
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(rect.width as usize),
+            Style::default().fg(BORDER),
+        ))),
+        Rect {
+            x: rect.x,
+            y: rect.y + 4,
+            width: rect.width,
+            height: 1,
+        },
+    );
+}
+
+fn span_width(spans: &[Span<'_>]) -> usize {
+    spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum()
 }
 
 fn compact_cat_lines(cells: Vec<Vec<brand::CellSpec>>) -> Vec<Line<'static>> {
@@ -2551,19 +2588,13 @@ fn render_hint(frame: &mut Frame, area: Rect, state: &TuiState) {
     }
 }
 
-fn render_input(frame: &mut Frame, area: Rect, state: &TuiState, model: &str) {
+fn render_input(frame: &mut Frame, area: Rect, state: &TuiState) {
     let busy = state.busy;
-    let border = if busy { DIM } else { ACCENT };
-    let title = if busy {
-        format!(" {} · {model} ", state.activity_word(24))
-    } else {
-        format!(" {} · {model} ", state.mode)
-    };
+    let border = if busy { BORDER } else { ACCENT };
     let block = Block::default()
-        .borders(Borders::BOTTOM)
+        .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border))
-        .title_bottom(Line::from(Span::styled(title, dim())).alignment(Alignment::Right));
+        .border_style(Style::default().fg(border));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height == 0 || inner.width < 5 {
@@ -2621,7 +2652,10 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &TuiState) {
         None if state.busy => "esc interrupt · enter queue a message",
         None => "enter send · shift+tab mode · / commands",
     };
-    let right = format!("tokens {} / {}", state.total_in, state.total_out);
+    let right = format!(
+        "{} · tokens {} / {}",
+        state.mode, state.total_in, state.total_out
+    );
     let pad = inner
         .width
         .saturating_sub((left.chars().count() + right.chars().count()) as u16)
@@ -2641,7 +2675,7 @@ fn render_todos(frame: &mut Frame, area: Rect, todos: &[TodoItem]) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(DIM))
+        .border_style(Style::default().fg(BORDER))
         .padding(Padding::new(1, 1, 0, 0))
         .title(Line::from(Span::styled("todos", dim())));
     let inner = block.inner(area);
@@ -2819,7 +2853,7 @@ mod tests {
             .draw(|frame| render(frame, &mut state, "deepseek-chat", "20261109-abcdef12"))
             .expect("draw");
         let text = buffer_text(&terminal);
-        assert!(text.contains("whisker"));
+        assert!(text.contains("✻ whisker"));
         assert!(text.contains("a cat for your codebase"));
         assert!(text.contains("deepseek-chat"));
         assert!(text.contains('▀') || text.contains('█'));
@@ -3103,20 +3137,21 @@ mod tests {
             .draw(|frame| render(frame, &mut state, "mock", "session"))
             .expect("draw");
         let prompt_row = (0..30)
-            .find(|y| row_text(&terminal, *y).starts_with('❯'))
+            .find(|y| row_text(&terminal, *y).contains('❯'))
             .expect("prompt row");
         let first = row_text(&terminal, prompt_row);
         let second = row_text(&terminal, prompt_row + 1);
-        assert!(first.starts_with("❯ a"));
+        assert!(first.starts_with("│❯ a"));
         assert_eq!(
-            first.chars().skip(2).take_while(|ch| *ch == 'a').count(),
-            57
+            first.chars().skip(3).take_while(|ch| *ch == 'a').count(),
+            55
         );
-        assert!(second.starts_with("  a"));
-        assert!(row_text(&terminal, prompt_row + 2).starts_with("  a"));
-        let border = row_text(&terminal, prompt_row + 3);
-        assert!(border.starts_with('─'), "border row: {border:?}");
-        assert!(border.contains("normal · mock"));
+        assert!(second.starts_with("│  a"));
+        assert!(row_text(&terminal, prompt_row + 2).starts_with("│  a"));
+        let top = row_text(&terminal, prompt_row - 1);
+        assert!(top.starts_with('╭'), "top border: {top:?}");
+        let bottom = row_text(&terminal, prompt_row + 3);
+        assert!(bottom.starts_with('╰'), "bottom border: {bottom:?}");
     }
 
     #[test]
