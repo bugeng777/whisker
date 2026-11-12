@@ -1,0 +1,41 @@
+{
+  "name": "@bugeng777/whisker",
+  "version": "0.6.1",
+  "description": "Terminal coding agent for OpenAI-compatible models",
+  "license": "MIT",
+  "bin": {
+    "whisker": "bin/whisker.js"
+  },
+  "files": [
+    "bin",
+    "scripts/postinstall.js",
+    "checksums.json",
+    "LICENSE"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bugeng777/whisker.git",
+    "directory": "npm/whisker"
+  },
+  "bugs": {
+    "url": "https://github.com/bugeng777/whisker/issues"
+  },
+  "homepage": "https://github.com/bugeng777/whisker#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ]
+}

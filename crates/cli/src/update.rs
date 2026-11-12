@@ -6,8 +6,17 @@ use serde::{Deserialize, Serialize};
 
 const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
 const GITHUB_LATEST: &str = "https://api.github.com/repos/bugeng777/whisker/releases/latest";
-const INSTALL_COMMAND: &str =
+const CURL_UPGRADE: &str =
     "curl -fsSL https://github.com/bugeng777/whisker/releases/latest/download/install.sh | bash";
+const BREW_UPGRADE: &str = "brew update && brew upgrade whisker";
+const NPM_UPGRADE: &str = "npm install -g @bugeng777/whisker@latest";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallChannel {
+    Homebrew,
+    Npm,
+    Curl,
+}
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct UpdateCache {
@@ -57,8 +66,31 @@ fn is_due(last_checked: u64, now: u64) -> bool {
     now.saturating_sub(last_checked) >= CHECK_INTERVAL_SECS
 }
 
-fn update_message(current: &str, latest: &str) -> String {
-    format!("Update available: {latest} (current v{current})\nReinstall: {INSTALL_COMMAND}")
+fn is_homebrew_path(path: &str) -> bool {
+    path.contains("/Cellar/whisker/") || path.contains("/opt/whisker/")
+}
+
+fn install_channel(exe: &Path) -> InstallChannel {
+    let text = exe.to_string_lossy().replace('\\', "/");
+    if is_homebrew_path(&text) {
+        InstallChannel::Homebrew
+    } else if text.contains("/node_modules/") {
+        InstallChannel::Npm
+    } else {
+        InstallChannel::Curl
+    }
+}
+
+fn upgrade_command(channel: InstallChannel) -> &'static str {
+    match channel {
+        InstallChannel::Homebrew => BREW_UPGRADE,
+        InstallChannel::Npm => NPM_UPGRADE,
+        InstallChannel::Curl => CURL_UPGRADE,
+    }
+}
+
+fn update_message(current: &str, latest: &str, command: &str) -> String {
+    format!("Update available: {latest} (current v{current})\nUpgrade: {command}")
 }
 
 fn latest_release_url() -> String {
@@ -107,7 +139,9 @@ pub async fn check_for_update(home: &Path) -> Option<String> {
     let message =
         if is_newer(current, &latest) && cache.notified.as_deref() != Some(latest.as_str()) {
             cache.notified = Some(latest.clone());
-            Some(update_message(current, &latest))
+            let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("whisker"));
+            let command = upgrade_command(install_channel(&exe));
+            Some(update_message(current, &latest, command))
         } else {
             None
         };
@@ -149,9 +183,47 @@ mod tests {
 
     #[test]
     fn reminder_names_versions_and_command() {
-        let message = update_message("0.6.1", "v0.6.2");
+        let message = update_message("0.6.1", "v0.6.2", CURL_UPGRADE);
         assert!(message.contains("v0.6.2"));
         assert!(message.contains("current v0.6.1"));
+        assert!(message.contains("Upgrade:"));
         assert!(message.contains("install.sh | bash"));
+    }
+
+    #[test]
+    fn upgrade_command_follows_the_install_path() {
+        assert_eq!(
+            install_channel(Path::new("/opt/homebrew/Cellar/whisker/0.6.1/bin/whisker")),
+            InstallChannel::Homebrew
+        );
+        assert_eq!(
+            install_channel(Path::new(
+                "/home/linuxbrew/.linuxbrew/Cellar/whisker/0.6.1/bin/whisker"
+            )),
+            InstallChannel::Homebrew
+        );
+        assert_eq!(
+            install_channel(Path::new("/usr/local/opt/whisker/bin/whisker")),
+            InstallChannel::Homebrew
+        );
+        assert_eq!(
+            install_channel(Path::new(
+                "/usr/lib/node_modules/@bugeng777/whisker/vendor/whisker"
+            )),
+            InstallChannel::Npm
+        );
+        assert_eq!(
+            install_channel(Path::new("/home/me/.local/bin/whisker")),
+            InstallChannel::Curl
+        );
+        assert_eq!(
+            install_channel(Path::new(
+                "/home/me/projects/homebrew-tools/target/release/whisker"
+            )),
+            InstallChannel::Curl
+        );
+        assert_eq!(upgrade_command(InstallChannel::Homebrew), BREW_UPGRADE);
+        assert_eq!(upgrade_command(InstallChannel::Npm), NPM_UPGRADE);
+        assert!(upgrade_command(InstallChannel::Curl).contains("install.sh"));
     }
 }

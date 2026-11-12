@@ -23,3 +23,7 @@ jobs:
         run: cargo build --release
       - name: Validate eval fixtures
         run: python3 eval/run.py --dry-run
+      - name: Check install channels
+        run: |
+          python3 scripts/sync-install-channels.py --check
+          node --test npm/whisker/scripts/postinstall.test.js

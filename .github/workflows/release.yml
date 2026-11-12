@@ -47,7 +47,9 @@ jobs:
           set -euo pipefail
           mkdir -p "dist/${{ matrix.target }}"
           cp "target/${{ matrix.target }}/release/whisker" "dist/${{ matrix.target }}/whisker"
-          cp README.md config.example.toml "dist/${{ matrix.target }}/"
+          files=(README.md config.example.toml)
+          if [ -f LICENSE ]; then files+=(LICENSE); fi
+          cp "${files[@]}" "dist/${{ matrix.target }}/"
           tar -C "dist/${{ matrix.target }}" -czf "dist/whisker-${{ matrix.target }}.tar.gz" .
       - uses: actions/upload-artifact@v4
         with:
@@ -70,6 +72,8 @@ jobs:
           cd dist
           sha256sum whisker-*.tar.gz > SHA256SUMS
           cat SHA256SUMS
+      - name: Update Homebrew and npm metadata
+        run: python3 scripts/sync-install-channels.py --version "$RELEASE_TAG" --checksums dist/SHA256SUMS
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -81,3 +85,48 @@ jobs:
             gh release create "$RELEASE_TAG" dist/whisker-*.tar.gz dist/SHA256SUMS install.sh \
               --title "$RELEASE_TAG" --generate-notes
           fi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Publish npm package
+        working-directory: npm/whisker
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NODE_AUTH_TOKEN}" ]; then
+            echo "NPM_TOKEN is not set; skipping npm publish"
+            exit 0
+          fi
+          if [ -f ../../LICENSE ]; then
+            cp ../../LICENSE LICENSE
+          fi
+          version="${RELEASE_TAG#v}"
+          if npm view "@bugeng777/whisker@${version}" version >/dev/null 2>&1; then
+            echo "npm version ${version} is already published"
+            exit 0
+          fi
+          npm publish --access public
+      - name: Push installer metadata
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          tmp="$(mktemp -d)"
+          cp Formula/whisker.rb "$tmp/whisker.rb"
+          cp npm/whisker/checksums.json "$tmp/checksums.json"
+          cp npm/whisker/package.json "$tmp/package.json"
+          git fetch origin +refs/heads/main:refs/remotes/origin/main
+          git checkout --force -B main origin/main
+          mkdir -p Formula npm/whisker
+          cp "$tmp/whisker.rb" Formula/whisker.rb
+          cp "$tmp/checksums.json" npm/whisker/checksums.json
+          cp "$tmp/package.json" npm/whisker/package.json
+          git add Formula/whisker.rb npm/whisker/checksums.json npm/whisker/package.json
+          if git diff --cached --quiet; then
+            echo "installer metadata already current"
+            exit 0
+          fi
+          git commit -m "Update Homebrew and npm installers to ${RELEASE_TAG}"
+          git push origin main

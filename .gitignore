@@ -1,2 +1,3 @@
 target/
 .env
+npm/whisker/vendor/
