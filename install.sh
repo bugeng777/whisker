@@ -90,6 +90,18 @@ tmpbin="$INSTALL_DIR/.whisker.$$"
 install -m 0755 "$tmp/whisker" "$tmpbin"
 mv -f "$tmpbin" "$INSTALL_DIR/whisker"
 
+if [ -d "$tmp/skills" ]; then
+  skill_root="$HOME/.whisker/skills"
+  mkdir -p "$skill_root"
+  for skill in "$tmp"/skills/*; do
+    [ -e "$skill" ] || continue
+    name="$(basename "$skill")"
+    rm -rf "$skill_root/$name"
+    cp -R "$skill" "$skill_root/$name"
+  done
+  echo "skills: $skill_root"
+fi
+
 echo "installed: $INSTALL_DIR/whisker"
 "$INSTALL_DIR/whisker" --version || true
 case ":$PATH:" in

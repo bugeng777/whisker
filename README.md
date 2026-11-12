@@ -181,7 +181,10 @@ description: Review the current diff for correctness and missing tests
 ```
 
 The model sees only the name and description; it calls the `skill` tool to load the
-procedure when a task matches.
+procedure when a task matches. This repo includes [Impeccable](https://github.com/pbakaus/impeccable)
+(Apache-2.0) for frontend design. In a session, `/impeccable` or `/impeccable polish the header`
+loads it. Release installs copy that skill to `~/.whisker/skills/impeccable` (Homebrew puts it
+in the formula's share directory; npm keeps it next to the downloaded binary).
 
 ## Hooks
 

@@ -82,6 +82,9 @@ def formula_text(version: str, sums: dict[str, str]) -> str:
 
   def install
     bin.install "whisker"
+    if File.directory?("skills/impeccable")
+      (pkgshare/"skills").install "skills/impeccable"
+    end
   end
 
   test do
